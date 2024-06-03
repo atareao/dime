@@ -1,0 +1,7 @@
+log_level: info
+base_url: api.openai.com
+endpoint: v1/chat/completions
+models_endpoint: v1/models
+token: ''
+model: gpt-4o
+temperature: '1'
