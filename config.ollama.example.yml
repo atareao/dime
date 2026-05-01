@@ -1,0 +1,11 @@
+---
+# Configuración para Ollama en localhost
+provider: "ollama"
+base_url: "localhost:11434"
+use_https: false
+endpoint: "api/chat"
+models_endpoint: "api/tags"
+token: "" # Ollama no requiere token
+model: "llama2" # o el modelo que tengas instalado en Ollama
+temperature: "1"
+log_level: "info"
