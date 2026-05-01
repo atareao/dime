@@ -1,4 +1,4 @@
-use hyper::Request;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
@@ -6,8 +6,6 @@ use std::fmt;
 use std::{path::PathBuf, process};
 use tokio::fs::read_to_string;
 use tracing::{debug, error, info};
-
-use hyper::Client;
 
 #[derive(Debug)]
 pub struct IABotError {
@@ -126,12 +124,7 @@ impl IABot {
         debug!("Provider: {}", self.provider);
         debug!("Question: {}", question);
 
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .https_only()
-            .enable_http1()
-            .build();
-        let client = Client::builder().build(https);
+        let client = Client::new();
 
         let body = serde_json::to_string(&json!({
             "model": self.model,
@@ -142,10 +135,7 @@ impl IABot {
         }))
         .unwrap();
 
-        let mut request_builder = Request::builder()
-            .method("POST")
-            .uri(&url)
-            .header("Content-Type", "application/json");
+        let mut request_builder = client.post(&url).header("Content-Type", "application/json");
 
         // Agregar token solo si es OpenAI y el token no está vacío
         if self.provider.to_lowercase() == "openai" && !self.token.is_empty() {
@@ -153,12 +143,9 @@ impl IABot {
                 request_builder.header("Authorization", format!("Bearer {}", self.token));
         }
 
-        let request = request_builder.body(hyper::Body::from(body)).unwrap();
-
-        match client.request(request).await {
+        match request_builder.body(body).send().await {
             Ok(resp) => {
-                let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-                let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+                let body = resp.text().await?;
                 debug!("{}", &body);
 
                 let data: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -186,7 +173,7 @@ impl IABot {
             }
             Err(e) => {
                 error!("{}", e);
-                Err(Box::new(e))
+                Err(e.into())
             }
         }
     }
