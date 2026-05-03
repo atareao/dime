@@ -1,5 +1,6 @@
 ---
 # Configuración para Ollama en localhost
+system_role: "Eres un asistente util y conciso. Responde en espanol claro."
 provider: "ollama"
 base_url: "localhost:11434"
 use_https: false
@@ -8,4 +9,5 @@ models_endpoint: "api/tags"
 token: "" # Ollama no requiere token
 model: "llama2" # o el modelo que tengas instalado en Ollama
 temperature: "1"
+num_ctx: 32000
 log_level: "info"

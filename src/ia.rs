@@ -33,6 +33,8 @@ impl Error for IABotError {} // Defaul
 pub struct IABot {
     #[serde(default = "get_default_log_level")]
     log_level: String,
+    #[serde(default = "get_default_system_role")]
+    system_role: String,
     #[serde(default = "get_default_provider")]
     provider: String,
     #[serde(default = "get_default_base_url")]
@@ -48,12 +50,18 @@ pub struct IABot {
     // What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
     #[serde(default = "get_default_temperature")]
     temperature: String,
+    #[serde(default = "get_default_num_ctx")]
+    num_ctx: u32,
     #[serde(default = "get_default_use_https")]
     use_https: bool,
 }
 
 fn get_default_log_level() -> String {
     "info".to_string()
+}
+
+fn get_default_system_role() -> String {
+    "Eres un asistente util y conciso. Responde en espanol claro.".to_string()
 }
 
 fn get_default_provider() -> String {
@@ -88,9 +96,17 @@ fn get_default_temperature() -> String {
     "1".to_string()
 }
 
+fn get_default_num_ctx() -> u32 {
+    32000
+}
+
 impl IABot {
     pub fn get_log_level(&self) -> &str {
         &self.log_level
+    }
+
+    pub fn get_system_role(&self) -> &str {
+        &self.system_role
     }
 
     pub fn get_provider(&self) -> &str {
@@ -126,14 +142,28 @@ impl IABot {
 
         let client = Client::new();
 
-        let body = serde_json::to_string(&json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": question}
-            ]
-        }))
-        .unwrap();
+        let body = if self.provider.eq_ignore_ascii_case("ollama") {
+            serde_json::to_string(&json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": question}
+                ],
+                "options": {
+                    "num_ctx": self.num_ctx,
+                }
+            }))
+            .unwrap()
+        } else {
+            serde_json::to_string(&json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": question}
+                ]
+            }))
+            .unwrap()
+        };
 
         let mut request_builder = client.post(&url).header("Content-Type", "application/json");
 
@@ -181,6 +211,7 @@ impl IABot {
     fn default() -> Self {
         Self {
             log_level: get_default_log_level(),
+            system_role: get_default_system_role(),
             provider: get_default_provider(),
             base_url: get_default_base_url(),
             endpoint: get_default_endpoint(),
@@ -188,6 +219,7 @@ impl IABot {
             token: get_default_token(),
             model: get_default_model(),
             temperature: get_default_temperature(),
+            num_ctx: get_default_num_ctx(),
             use_https: get_default_use_https(),
         }
     }

@@ -1,5 +1,6 @@
 ---
 # Configuración para OpenAI
+system_role: "Eres un asistente util y conciso. Responde en espanol claro."
 provider: "openai"
 base_url: "api.openai.com"
 use_https: true
@@ -8,4 +9,5 @@ models_endpoint: "v1/models"
 token: "sk-your-openai-api-key-here"
 model: "gpt-3.5-turbo"
 temperature: "1"
+num_ctx: 32000
 log_level: "info"

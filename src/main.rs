@@ -13,11 +13,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 struct Args {
     /// Instructions of ChatGPT behaivur
     #[arg(short, long)]
-    instructions: String,
+    instructions: Option<String>,
 
     /// Question for ChatGPT
-    #[arg(short, long)]
-    question: String,
+    #[arg(short = 'q', long = "question", conflicts_with = "question")]
+    question_flag: Option<String>,
+
+    /// Question for ChatGPT
+    #[arg(value_name = "QUESTION", required_unless_present = "question_flag")]
+    question: Option<String>,
 }
 
 #[tokio::main]
@@ -43,7 +47,17 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    match iabot.ask(&args.instructions, &args.question).await {
+    let system_role = args
+        .instructions
+        .as_deref()
+        .unwrap_or(iabot.get_system_role());
+    let question = args
+        .question_flag
+        .as_deref()
+        .or(args.question.as_deref())
+        .unwrap();
+
+    match iabot.ask(system_role, question).await {
         Ok(response) => {
             println!("{}", response)
         }
