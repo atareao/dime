@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - "*"
 
 permissions:
   contents: write
@@ -11,11 +12,11 @@ jobs:
   build-linux:
     name: Build Linux Binary
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -24,7 +25,7 @@ jobs:
 
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      
+
       - name: Build release binary
         run: |
           # Estas variables fuerzan a que todo sea estático
@@ -40,18 +41,20 @@ jobs:
         run: |
           cd target/x86_64-unknown-linux-musl/release
           mv dime dime-linux-x86_64
-      
+
       - name: Generate SHA256 checksum
         run: |
           cd target/x86_64-unknown-linux-musl/release
           sha256sum dime-linux-x86_64 > dime-linux-x86_64.sha256
-      
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: |
             target/x86_64-unknown-linux-musl/release/dime-linux-x86_64
             target/x86_64-unknown-linux-musl/release/dime-linux-x86_64.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
