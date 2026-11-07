@@ -368,7 +368,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "dime"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arboard",
  "base64 0.23.1",
