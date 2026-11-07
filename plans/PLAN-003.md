@@ -15,7 +15,7 @@ Un plan único con **7 fases**. Cada fase es un cambio OpenSpec propio y un **PR
 
 ## Fases
 
-### Fase 1 — Overrides por CLI (cambio `cli-overrides`)
+### Fase 1 — Overrides por CLI (cambio `cli-overrides`) — ✅ Completada (PR #29 squash → `development`)
 
 Flags que pisan `dime.yml` **solo para esa invocación**, sin modificar el fichero: `--model`, `--temperature`, `--provider` y `--system` (alias/equivalente de `-i/--instructions`).
 - Specs: `config` (los overrides no se persisten), `chat` (usan los valores efectivos).
@@ -60,9 +60,9 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Criterios de aceptación globales
 
-- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`.
-- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 2–3)*
-- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 2–3)*
+- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–3 cumplen el criterio; pendientes Fases 4–7)*
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–3)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–3)*
 
 ## Riesgos
 
@@ -71,4 +71,4 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Versionado
 
-`0.4.0` al cerrar la **Fase 1** (las Fases 2–3 ya están completadas y mergeadas, pero no se ha bumpeado la versión: sigue `0.3.0`); las fases 4–7 en incrementos posteriores. Solo faltan la Fase 1 y las Fases 4–7.
+**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las Fases 4–7 en incrementos posteriores.
