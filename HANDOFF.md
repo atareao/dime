@@ -2,11 +2,13 @@
 
 ## Estado
 
-- `main` y `development` en **`0.5.0`** (ambos en `fc5a819`), con **PLAN-003 COMPLETO (Fases 1–7)** mergeadas (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash) y promocionadas a `main` vía PR #39 (merge commit). Release **`v0.5.0`** publicada (tag + `release.yml` en verde): binario `dime-linux-x86_64` (11.3 MB) y su `.sha256`.
+- `development` en **`0.5.1`** (`210880e`, PR #40 squash) y `main` en **`0.5.0`** (`fc5a819`), pendiente de promoción. **PLAN-003 COMPLETO (Fases 1–7)** mergeado (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash) y promocionado a `main` vía PR #39 (merge commit). Release **`v0.5.0`** publicada (tag + `release.yml` en verde): binario `dime-linux-x86_64` (11.3 MB) y su `.sha256`.
 - PLAN-003 cerrado y archivado en `plans/PLAN-003-ARCHIVED.md`.
-- Tarea pendiente: revisar/mergear las dos ramas de Dependabot en remoto (`dependabot/cargo/bytes-1.11.1`, `dependabot/cargo/tracing-subscriber-0.3.20`).
+- Dependabot al día: las ramas obsoletas (`bytes-1.11.1`, `tracing-subscriber-0.3.20`) se borraron; no queda nada pendiente por ese lado. Rama actual de cierre documental: `chore/close-http-status-handling`.
 
 ## Historial reciente
+
+- **Bugfix `http-status-handling`** (v0.5.1, specs `chat` y `models`; PR #40 squash → `development`): `ask()` y `list_models()` comprueban `response.status()` antes de interpretar el cuerpo con el helper puro compartido `check_status(status, body)`. Éxito **solo `2xx`** (`3xx` también es error). Precedencia: si el cuerpo trae `error` del proveedor con mensaje → `IABotError::Api` con el código (`Error devuelto por el proveedor (HTTP 401): invalid_api_key`); si no lo trae, o `error` no aporta mensaje → `IABotError::Status(StatusCode)` (`El proveedor respondió con el estado HTTP 500 Internal Server Error`). Un cuerpo con forma válida ya no se acepta con estado no exitoso. Helpers `api_error(message, Option<StatusCode>)` y `find_provider_error`. Nuevo e2e `server_error_with_valid_chat_body_is_not_accepted` (12 tests en `tests/http_mock.rs`). Bump `0.5.0` → **`0.5.1`** (`vampus upgrade --patch`). Change archivada en `openspec/changes/archive/2026-11-07-http-status-handling`.
 
 - **PLAN-001** (v0.2.0): normalización del repositorio y saneamiento del CLI — errores tipados con `thiserror`, sin `unwrap()`/`panic!` en producción, `temperature` operativa, token redactado, código muerto retirado, CI (`fmt`/`clippy`/`build`/`test`) en `main` y `development`, Dependabot, `.gitignore` protegiendo secretos. Specs OpenSpec `config` y `chat`.
 - **PLAN-002** (v0.3.0): follow-ups — migración `serde_yaml` → `serde_norway`; `temperature` tipada como `f64` con deserialización tolerante (número o cadena numérica); nuevo comando `--list-models` (nueva spec `models`, soporta OpenAI `v1/models` y Ollama `api/tags`, reintroduce `models_endpoint`).
@@ -22,13 +24,12 @@
 
 ## Estado del código
 
-- 149 tests unitarios (`src/ia.rs`, `src/main.rs`; +1 marcado `#[ignore]` para el roundtrip real del portapapeles) + 2 de integración (`tests/attachments.rs`) + 4 de integración (`tests/command_mode.rs`) + 8 de integración (`tests/completions.rs`) + 11 de integración (`tests/http_mock.rs`) + 4 de integración (`tests/scripting_output.rs`).
+- 162 tests unitarios (`src/ia.rs`, `src/main.rs`; +1 marcado `#[ignore]` para el roundtrip real del portapapeles) + 2 de integración (`tests/attachments.rs`) + 4 de integración (`tests/command_mode.rs`) + 8 de integración (`tests/completions.rs`) + 12 de integración (`tests/http_mock.rs`) + 4 de integración (`tests/scripting_output.rs`).
 - `cargo fmt --check`, `cargo clippy -D warnings` y `cargo test` en verde.
-- 9 specs vigentes en `openspec/specs/`: `attachments` (2), `chat` (7), `clipboard` (1), `command` (5), `completions` (2), `config` (7), `models` (2), `output` (2), `http-testing` (4).
+- 9 specs vigentes en `openspec/specs/` (34 requisitos): `attachments` (2), `chat` (8), `clipboard` (1), `command` (5), `completions` (2), `config` (7), `models` (3), `output` (2), `http-testing` (4).
 
 ## Follow-ups
 
-- `ask()` no inspecciona `response.status()`: un `500` con un cuerpo de chat válido se trataría como éxito; endurecerlo y cubrir el caso con un test.
 - `--exec`: valorar **sandboxing** (límites de tiempo, entorno restringido, directorio controlado); hoy ejecuta con `sh -c` y los permisos del usuario.
 - `clean_command`: el heurístico de fences de una línea es conservador (no descarta el lenguaje si el resto empieza por `-`, `./` o `/`); revisarlo si aparecen nuevos formatos de respuesta.
 - Cota de tamaño al leer adjuntos (`--file`/`--image`; hoy sin límite).
@@ -36,7 +37,7 @@
 
 ## Siguiente paso
 
-Revisar y mergear (o cerrar) las dos ramas de Dependabot en remoto: `dependabot/cargo/bytes-1.11.1` y `dependabot/cargo/tracing-subscriber-0.3.20`. Después, atacar los follow-ups técnicos de arriba cuando toque.
+Mergear esta rama documental (`chore/close-http-status-handling` → `development`), promocionar `development` → `main` (PR) y publicar la release **`v0.5.1`** con su tag. Después, atacar los follow-ups técnicos de arriba cuando toque.
 
 ## Flujo
 
