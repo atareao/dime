@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs::read_to_string;
 use tracing::{debug, error, info};
 
@@ -24,6 +24,251 @@ pub enum IABotError {
     /// La respuesta no tiene ni `choices` ni `error`.
     #[error("Respuesta inesperada del proveedor: no contiene `choices` ni `error`")]
     UnexpectedResponse,
+    /// La entrada del usuario no es utilizable: falta la pregunta o `stdin` no
+    /// aporta datos cuando se esperaban.
+    #[error("Entrada no válida: {0}")]
+    Input(String),
+    /// El proveedor indicado por CLI (`--provider`) no es válido.
+    ///
+    /// Es un error del flag, no del fichero, por eso tiene un mensaje propio y
+    /// no se usa [`IABotError::Config`].
+    #[error("proveedor no soportado: `{0}`; valores válidos: `openai`, `ollama`")]
+    Provider(String),
+    /// Un adjunto (`--file` o `--image`) no se pudo leer o no es válido.
+    ///
+    /// Cubre ficheros inexistentes o no UTF-8, imágenes ilegibles y extensiones
+    /// de imagen no soportadas.
+    #[error("Error con el adjunto: {0}")]
+    Attachment(String),
+    /// No se pudo escribir en el portapapeles (`--copy`).
+    ///
+    /// Es *best-effort*: el llamante advierte y continúa con código de salida
+    /// cero, por lo que nunca interrumpe el comando.
+    #[error("No se pudo copiar al portapapeles: {0}")]
+    Clipboard(String),
+    /// No se pudo ejecutar el comando generado con `--exec`.
+    ///
+    /// Cubre fallos al lanzar el shell (`sh` ausente, permisos, etc.). El código
+    /// de salida del hijo no es un error: se propaga como código de `dime`.
+    #[error("No se pudo ejecutar el comando: {0}")]
+    Execution(String),
+}
+
+/// Rol de sistema del modo comando (`--cmd`).
+///
+/// Pide al modelo **únicamente** el comando que cumple el objetivo: sin
+/// explicaciones, sin comentarios y sin bloques de código ni fences de Markdown,
+/// de modo que la respuesta se pueda imprimir (y ejecutar) tal cual.
+pub const COMMAND_SYSTEM_ROLE: &str = "Responde únicamente con el comando de shell que cumple el objetivo, sin explicaciones, sin comentarios y sin bloques de código ni fences de Markdown. Devuelve una sola línea de comando.";
+
+/// Lenguajes de fence que se descartan cuando el bloque va en una sola línea.
+const FENCE_LANGUAGES: [&str; 6] = ["bash", "sh", "zsh", "shell", "console", "fish"];
+
+/// Limpia la respuesta del modelo para dejar sólo el comando.
+///
+/// Elimina los fences de Markdown (```` ```bash ````, ```` ``` ````), un par de
+/// backticks inline que envuelva todo el comando y los espacios sobrantes. Si la
+/// respuesta contiene un bloque de código precedido de prosa, devuelve el
+/// contenido del primer bloque; si no hay fences, devuelve el texto recortado
+/// tal cual. Es una función pura: no toca red ni sistema de archivos.
+///
+/// Casos límite (todos cubiertos por tests):
+/// - Un fence de una línea sólo descarta el lenguaje si el resto no empieza por
+///   `-`, `./` ni `/`; si sólo contiene el lenguaje, devuelve cadena vacía.
+/// - Los backticks inline sólo se recortan si envuelven todo el texto sin otros
+///   backticks dentro; varias sustituciones quedan intactas.
+///
+/// Quitar los backticks envolventes es una medida de **seguridad**: el comando
+/// se imprime y, con `--exec`, se pasa a `sh -c`, donde `` `...` `` se
+/// interpretaría como sustitución de comando (lo mostrado debe ser exactamente
+/// lo ejecutado).
+pub fn clean_command(text: &str) -> String {
+    let trimmed = text.trim();
+
+    let Some(start) = trimmed.find("```") else {
+        return strip_wrapping_backticks(trimmed);
+    };
+
+    // Todo lo que sigue al fence de apertura.
+    let after_open = &trimmed[start + 3..];
+
+    // La primera línea del bloque puede ser el lenguaje (`bash`, `sh`…): se
+    // descarta. Sin salto de línea, el bloque está en una sola línea y el
+    // lenguaje puede venir seguido del comando.
+    let (body, had_newline) = match after_open.find('\n') {
+        Some(newline) => (&after_open[newline + 1..], true),
+        None => (after_open, false),
+    };
+
+    // Si hay fence de cierre, el comando termina justo antes.
+    let body = match body.find("```") {
+        Some(end) => &body[..end],
+        None => body,
+    };
+
+    let body = if had_newline {
+        body
+    } else {
+        strip_fence_language(body)
+    };
+
+    strip_wrapping_backticks(body.trim())
+}
+
+/// Descarta un token de lenguaje conocido al inicio de un fence de una línea.
+///
+/// `bash touch /tmp/x` → `touch /tmp/x`. Para no mutilar comandos legítimos, el
+/// token **no** se descarta si el resto empieza por `-`, `./` o `/` (p. ej.
+/// `bash -c "echo hi"` o `sh ./script.sh`), y un bloque que sólo contiene el
+/// lenguaje se reduce a cadena vacía (no es un comando ejecutable).
+fn strip_fence_language(body: &str) -> &str {
+    let trimmed = body.trim();
+    if FENCE_LANGUAGES
+        .iter()
+        .any(|language| trimmed.eq_ignore_ascii_case(language))
+    {
+        return "";
+    }
+
+    if let Some((first, rest)) = body.split_once(|c: char| c.is_whitespace()) {
+        if FENCE_LANGUAGES
+            .iter()
+            .any(|language| first.eq_ignore_ascii_case(language))
+        {
+            let rest = rest.trim_start();
+            if !rest.is_empty()
+                && !rest.starts_with('-')
+                && !rest.starts_with("./")
+                && !rest.starts_with('/')
+            {
+                return rest;
+            }
+        }
+    }
+    body
+}
+
+/// Quita un par de backticks inline que envuelva **todo** el texto.
+///
+/// Sólo actúa cuando el primer y el último carácter son un único backtick, no
+/// hay ningún otro backtick dentro (así no se corrompen comandos con varias
+/// sustituciones, p. ej. `` `which ls` && `pwd` ``) y no son triples ni dobles.
+fn strip_wrapping_backticks(text: &str) -> String {
+    if text.len() >= 2
+        && text.starts_with('`')
+        && text.ends_with('`')
+        && !text.starts_with("``")
+        && !text.ends_with("``")
+        && !text[1..text.len() - 1].contains('`')
+    {
+        return text[1..text.len() - 1].trim().to_string();
+    }
+    text.to_string()
+}
+
+/// Compone el mensaje de usuario concatenando la pregunta con un contexto
+/// opcional (por ejemplo, el contenido leído de `stdin`).
+///
+/// Si `context` es `None` o sólo contiene espacios en blanco, devuelve la
+/// pregunta tal cual. En caso contrario, usa la pregunta seguida de una línea
+/// en blanco y el contexto recortado por la derecha.
+pub fn compose_user_message(question: &str, context: Option<&str>) -> String {
+    match context.map(str::trim_end) {
+        Some(context) if !context.is_empty() => format!("{question}\n\n{context}"),
+        _ => question.to_string(),
+    }
+}
+
+/// Un adjunto de imagen listo para enviar al proveedor.
+///
+/// `data` es la imagen ya codificada en base64 y `mime` su tipo MIME deducido
+/// de la extensión (`image/png`, `image/jpeg`, `image/gif` o `image/webp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// Tipo MIME de la imagen (p. ej. `image/png`).
+    pub mime: String,
+    /// Contenido de la imagen codificado en base64 (sin prefijo *data URL*).
+    pub data: String,
+}
+
+/// Compone el bloque de contexto a partir de una lista de `(ruta, contenido)`.
+///
+/// Cada fichero se precede de una cabecera `## <ruta>` seguida del contenido
+/// recortado por la derecha. Los ficheros se separan con una línea en blanco y
+/// se respeta el orden recibido. Sin ficheros devuelve una cadena vacía.
+pub fn compose_context(files: &[(String, String)]) -> String {
+    files
+        .iter()
+        .map(|(path, content)| format!("## {path}\n\n{}", content.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Lee cada ruta como texto UTF-8 y devuelve pares `(ruta, contenido)` en orden.
+///
+/// Un fichero inexistente o no UTF-8 produce [`IABotError::Attachment`] con un
+/// mensaje legible, sin *panic*.
+pub async fn read_files(paths: &[PathBuf]) -> Result<Vec<(String, String)>, IABotError> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let content = read_to_string(path).await.map_err(|e| {
+            IABotError::Attachment(format!(
+                "no se pudo leer el fichero `{}` como texto UTF-8: {e}",
+                path.display()
+            ))
+        })?;
+        files.push((path.display().to_string(), content));
+    }
+    Ok(files)
+}
+
+/// Deducir el MIME de una imagen a partir de su extensión.
+///
+/// Reconoce `png`, `jpg`/`jpeg`, `gif` y `webp` (insensible a mayúsculas).
+/// Cualquier otra extensión, o la ausencia de ella, produce
+/// [`IABotError::Attachment`].
+pub fn mime_from_path(path: &Path) -> Result<&'static str, IABotError> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" => Ok("image/png"),
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "gif" => Ok("image/gif"),
+        "webp" => Ok("image/webp"),
+        _ => Err(IABotError::Attachment(format!(
+            "extensión de imagen no soportada en `{}`; usa png, jpg, jpeg, gif o webp",
+            path.display()
+        ))),
+    }
+}
+
+/// Lee cada imagen, la codifica en base64 y deduce su MIME por extensión.
+///
+/// Una imagen inexistente, ilegible o con extensión no soportada produce
+/// [`IABotError::Attachment`].
+pub async fn read_images(paths: &[PathBuf]) -> Result<Vec<ImageAttachment>, IABotError> {
+    use base64::Engine;
+
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mime = mime_from_path(path)?;
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            IABotError::Attachment(format!(
+                "no se pudo leer la imagen `{}`: {e}",
+                path.display()
+            ))
+        })?;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        images.push(ImageAttachment {
+            mime: mime.to_string(),
+            data,
+        });
+    }
+    Ok(images)
 }
 
 /// Cliente de chat para proveedores compatibles con la API de OpenAI.
@@ -176,6 +421,12 @@ impl IABot {
         &self.system_role
     }
 
+    /// Devuelve el modelo configurado (usado como valor por defecto cuando el
+    /// proveedor no informa el modelo en su respuesta).
+    pub fn get_model(&self) -> &str {
+        &self.model
+    }
+
     /// Indica si el proveedor configurado es Ollama (comparación insensible a mayúsculas).
     fn is_ollama(&self) -> bool {
         self.provider.eq_ignore_ascii_case("ollama")
@@ -190,6 +441,44 @@ impl IABot {
                 "el token está vacío para un proveedor que lo requiere".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Aplica los overrides de una sola invocación sobre la configuración
+    /// efectiva (`model`, `temperature` y `provider`).
+    ///
+    /// Sólo muta los campos cuyo override está presente; el resto conserva el
+    /// valor de `dime.yml`. **Nunca** escribe ni modifica el fichero de
+    /// configuración: los overrides viven únicamente en memoria.
+    ///
+    /// Un `provider` distinto de `openai` u `ollama` (comparación insensible a
+    /// mayúsculas) devuelve [`IABotError::Config`] sin alterar la configuración.
+    ///
+    /// Este método se aplica tras `read_content` y **antes** de
+    /// [`IABot::validate`], de modo que un override a `ollama` exime de token.
+    pub fn apply_overrides(
+        &mut self,
+        model: Option<String>,
+        temperature: Option<f64>,
+        provider: Option<String>,
+    ) -> Result<(), IABotError> {
+        if let Some(provider) = &provider {
+            if !provider.eq_ignore_ascii_case("openai") && !provider.eq_ignore_ascii_case("ollama")
+            {
+                return Err(IABotError::Provider(provider.to_string()));
+            }
+        }
+
+        if let Some(model) = model {
+            self.model = model;
+        }
+        if let Some(temperature) = temperature {
+            self.temperature = temperature;
+        }
+        if let Some(provider) = provider {
+            self.provider = provider.to_ascii_lowercase();
+        }
+
         Ok(())
     }
 
@@ -222,14 +511,36 @@ impl IABot {
 
     /// Construye el cuerpo JSON de la petición sin tocar la red.
     ///
-    /// - `openai`: `temperature` en el nivel superior.
-    /// - `ollama`: `temperature` y `num_ctx` dentro de `options`.
-    fn build_body(&self, system: &str, question: &str) -> Result<String, IABotError> {
+    /// - `openai`: `temperature` en el nivel superior. El `content` del mensaje
+    ///   `user` es una cadena cuando no hay imágenes y un array de content parts
+    ///   (texto + `image_url` como *data URL* base64) cuando las hay.
+    /// - `ollama`: `temperature` y `num_ctx` dentro de `options`; las imágenes
+    ///   van en el campo `images` del mensaje `user` y `content` sigue siendo
+    ///   una cadena de texto.
+    fn build_body(
+        &self,
+        system: &str,
+        question: &str,
+        images: &[ImageAttachment],
+    ) -> Result<String, IABotError> {
         let temperature = self.temperature;
+
+        let user_message = if self.is_ollama() {
+            let mut message = json!({"role": "user", "content": question});
+            if !images.is_empty() {
+                if let Some(object) = message.as_object_mut() {
+                    let data: Vec<&str> = images.iter().map(|image| image.data.as_str()).collect();
+                    object.insert("images".to_string(), json!(data));
+                }
+            }
+            message
+        } else {
+            json!({"role": "user", "content": self.openai_content(question, images)})
+        };
 
         let messages = json!([
             {"role": "system", "content": system},
-            {"role": "user", "content": question}
+            user_message
         ]);
 
         let payload = if self.is_ollama() {
@@ -252,14 +563,41 @@ impl IABot {
         serde_json::to_string(&payload).map_err(|e| IABotError::Http(e.to_string()))
     }
 
+    /// Compone el `content` del mensaje `user` para `openai`.
+    ///
+    /// Sin imágenes devuelve la cadena de texto (compatibilidad con peticiones y
+    /// tests existentes). Con imágenes devuelve un array de content parts con la
+    /// primera parte de texto y una parte `image_url` por cada imagen.
+    fn openai_content(&self, question: &str, images: &[ImageAttachment]) -> serde_json::Value {
+        if images.is_empty() {
+            return json!(question);
+        }
+
+        let mut parts = vec![json!({"type": "text", "text": question})];
+        parts.extend(images.iter().map(|image| {
+            json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime, image.data)
+                }
+            })
+        }));
+        json!(parts)
+    }
+
     /// Envía la pregunta al proveedor y devuelve su respuesta.
-    pub async fn ask(&self, system: &str, question: &str) -> Result<String, IABotError> {
+    pub async fn ask(
+        &self,
+        system: &str,
+        question: &str,
+        images: &[ImageAttachment],
+    ) -> Result<ChatResponse, IABotError> {
         let url = self.build_url();
         debug!("Url: {}", url);
         debug!("Provider: {}", self.provider);
         debug!("Question: {}", question);
 
-        let body = self.build_body(system, question)?;
+        let body = self.build_body(system, question, images)?;
 
         let client = Client::new();
         let mut request_builder = client.post(&url).header("Content-Type", "application/json");
@@ -336,9 +674,29 @@ impl IABot {
     }
 }
 
+/// Respuesta de chat con metadatos, lista para serializar.
+///
+/// `content` es la respuesta del modelo; `model` es el modelo efectivamente
+/// usado y `usage` es el objeto de uso tal cual lo devuelve el proveedor
+/// (opaco). Cuando el proveedor no aporta `model` o `usage`, el campo es
+/// `None` y se serializa como `null`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatResponse {
+    /// Contenido textual de la respuesta.
+    pub content: String,
+    /// Modelo usado por el proveedor, si lo informa.
+    pub model: Option<String>,
+    /// Objeto de uso crudo del proveedor, si lo informa.
+    pub usage: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,17 +716,27 @@ struct ApiErrorBody {
 
 /// Interpreta el cuerpo de una respuesta de chat.
 ///
-/// Primero intenta el error del proveedor y después la respuesta estándar.
-/// El campo `error` puede ser un objeto con `message` o una cadena.
+/// Primero intenta el error del proveedor y después la respuesta estándar,
+/// devolviendo el contenido junto con el modelo y el objeto de uso cuando están
+/// presentes. El campo `error` puede ser un objeto con `message` o una cadena.
 /// Cualquier otra forma devuelve [`IABotError::UnexpectedResponse`], nunca un *panic*.
-fn parse_response(body: &str) -> Result<String, IABotError> {
+fn parse_response(body: &str) -> Result<ChatResponse, IABotError> {
     if let Some(err) = extract_api_error(body) {
         return Err(err);
     }
 
-    if let Ok(response) = serde_json::from_str::<ChatResponse>(body) {
-        if let Some(choice) = response.choices.into_iter().next() {
-            return Ok(choice.message.content);
+    if let Ok(response) = serde_json::from_str::<ApiChatResponse>(body) {
+        let ApiChatResponse {
+            choices,
+            model,
+            usage,
+        } = response;
+        if let Some(choice) = choices.into_iter().next() {
+            return Ok(ChatResponse {
+                content: choice.message.content,
+                model,
+                usage,
+            });
         }
     }
 
@@ -502,7 +870,7 @@ mod tests {
 
     #[test]
     fn build_body_openai_has_messages_and_temperature_at_top_level() {
-        let body = openai_bot().build_body("sys", "hola").expect("body");
+        let body = openai_bot().build_body("sys", "hola", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["model"], "gpt-3.5-turbo");
         assert_eq!(v["messages"][0]["role"], "system");
@@ -517,7 +885,7 @@ mod tests {
 
     #[test]
     fn build_body_ollama_puts_num_ctx_and_temperature_in_options() {
-        let body = ollama_bot().build_body("sys", "hola").expect("body");
+        let body = ollama_bot().build_body("sys", "hola", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["options"]["num_ctx"], 32000);
         assert_eq!(v["options"]["temperature"], serde_json::json!(1.0));
@@ -530,9 +898,62 @@ mod tests {
     fn build_body_uses_configured_temperature() {
         let mut b = bot();
         b.temperature = 0.2;
-        let body = b.build_body("sys", "q").expect("body");
+        let body = b.build_body("sys", "q", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.2));
+    }
+
+    // --- attachments/chat spec: Imágenes multimodales ---
+
+    fn image(mime: &str, data: &str) -> ImageAttachment {
+        ImageAttachment {
+            mime: mime.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_body_openai_with_image_uses_content_parts() {
+        let images = vec![image("image/png", "UE5HREFUQQ==")];
+        let body = openai_bot()
+            .build_body("sys", "describe", &images)
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let content = &v["messages"][1]["content"];
+        assert!(content.is_array(), "content debe ser array: {content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().expect("url");
+        assert!(url.starts_with("data:image/png;base64,"), "url: {url}");
+    }
+
+    #[test]
+    fn build_body_ollama_with_image_uses_images_field_and_string_content() {
+        let images = vec![image("image/png", "UE5HREFUQQ==")];
+        let body = ollama_bot()
+            .build_body("sys", "describe", &images)
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let user = &v["messages"][1];
+        assert!(user["content"].is_string(), "content: {}", user["content"]);
+        assert_eq!(user["content"], "describe");
+        assert_eq!(user["images"][0], "UE5HREFUQQ==");
+    }
+
+    #[test]
+    fn build_body_openai_without_images_keeps_content_as_string() {
+        let body = openai_bot().build_body("sys", "hola", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["messages"][1]["content"].is_string());
+        assert_eq!(v["messages"][1]["content"], "hola");
+    }
+
+    #[test]
+    fn build_body_ollama_without_images_omits_images_field() {
+        let body = ollama_bot().build_body("sys", "hola", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["messages"][1].get("images").is_none());
     }
 
     // --- chat spec: Tratamiento de respuestas ---
@@ -540,7 +961,28 @@ mod tests {
     #[test]
     fn parse_response_ok_returns_content() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"Hola"}}]}"#;
-        assert_eq!(parse_response(body).unwrap(), "Hola");
+        assert_eq!(parse_response(body).unwrap().content, "Hola");
+    }
+
+    // --- output/chat spec: respuesta con metadatos ---
+
+    #[test]
+    fn parse_response_exposes_content_model_and_usage() {
+        let body = r#"{"model":"gpt-4o","usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7},"choices":[{"message":{"role":"assistant","content":"Hola"}}]}"#;
+        let response = parse_response(body).expect("respuesta");
+        assert_eq!(response.content, "Hola");
+        assert_eq!(response.model.as_deref(), Some("gpt-4o"));
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage["total_tokens"], 7);
+    }
+
+    #[test]
+    fn parse_response_without_usage_has_none_usage() {
+        let body = r#"{"choices":[{"message":{"content":"Hola"}}]}"#;
+        let response = parse_response(body).expect("respuesta");
+        assert_eq!(response.content, "Hola");
+        assert!(response.model.is_none());
+        assert!(response.usage.is_none());
     }
 
     #[test]
@@ -811,7 +1253,7 @@ mod tests {
     #[test]
     fn parse_response_null_error_falls_back_to_choices() {
         let body = r#"{"error":null,"choices":[{"message":{"content":"Hola"}}]}"#;
-        assert_eq!(parse_response(body).unwrap(), "Hola");
+        assert_eq!(parse_response(body).unwrap().content, "Hola");
     }
 
     // --- MENOR 2: no existe dime.yml -> se crea con defaults ---
@@ -833,5 +1275,354 @@ mod tests {
         assert!(cfg.use_https);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- cli-overrides spec: overrides de una sola invocación ---
+
+    #[test]
+    fn apply_overrides_sets_model_temperature_and_provider() {
+        let mut b = openai_bot();
+        b.apply_overrides(
+            Some("gpt-4o".to_string()),
+            Some(0.2),
+            Some("ollama".to_string()),
+        )
+        .expect("overrides válidos");
+        assert_eq!(b.model, "gpt-4o");
+        assert_eq!(b.temperature, 0.2);
+        assert_eq!(b.provider, "ollama");
+    }
+
+    #[test]
+    fn apply_overrides_without_values_keeps_configuration() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, None, None).expect("sin overrides");
+        assert_eq!(b.model, "gpt-3.5-turbo");
+        assert_eq!(b.temperature, 1.0);
+        assert_eq!(b.provider, "openai");
+    }
+
+    #[test]
+    fn apply_overrides_temperature_only_keeps_model_and_provider() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, Some(0.2), None)
+            .expect("override de temperatura");
+        let body = b.build_body("sys", "q", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["temperature"], serde_json::json!(0.2));
+        assert_eq!(v["model"], "gpt-3.5-turbo");
+    }
+
+    #[test]
+    fn apply_overrides_provider_is_case_insensitive() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, None, Some("OLLAMA".to_string()))
+            .expect("proveedor válido");
+        assert!(b.is_ollama());
+        assert_eq!(b.provider, "ollama");
+    }
+
+    #[test]
+    fn apply_overrides_unknown_provider_is_provider_error_and_keeps_config() {
+        let mut b = openai_bot();
+        let err = b
+            .apply_overrides(None, None, Some("desconocido".to_string()))
+            .expect_err("proveedor inválido");
+        assert!(matches!(err, IABotError::Provider(_)), "err: {err}");
+        assert!(err.to_string().contains("desconocido"), "err: {err}");
+        assert!(
+            !err.to_string().contains("dime.yml"),
+            "el error no debe atribuirse al fichero: {err}"
+        );
+        assert_eq!(b.provider, "openai");
+    }
+
+    #[test]
+    fn apply_overrides_to_ollama_drops_auth_and_does_not_require_token() {
+        let mut b = openai_bot();
+        b.token = String::new();
+        b.apply_overrides(None, Some(0.2), Some("ollama".to_string()))
+            .expect("override a ollama");
+        // El override del proveedor se aplica ANTES de `validate()`: ollama no
+        // exige token.
+        assert!(b.validate().is_ok(), "ollama no debe exigir token");
+        assert_eq!(b.auth_header(), None, "ollama no envía Authorization");
+
+        let body = b.build_body("sys", "hola", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["options"]["num_ctx"], 32000);
+        assert_eq!(v["options"]["temperature"], serde_json::json!(0.2));
+        assert!(v.get("temperature").is_none());
+    }
+
+    // --- attachments spec: Contexto desde ficheros ---
+
+    fn temp_path(suffix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dime-attach-{}-{}-{}",
+            std::process::id(),
+            n,
+            suffix
+        ));
+        path
+    }
+
+    #[test]
+    fn compose_context_single_file_has_header_and_content() {
+        let files = vec![("README.md".to_string(), "hola mundo".to_string())];
+        let context = compose_context(&files);
+        assert!(context.contains("## README.md"), "contexto: {context}");
+        assert!(context.contains("hola mundo"), "contexto: {context}");
+    }
+
+    #[test]
+    fn compose_context_preserves_order() {
+        let files = vec![
+            ("a.txt".to_string(), "contenido A".to_string()),
+            ("b.txt".to_string(), "contenido B".to_string()),
+        ];
+        let context = compose_context(&files);
+        let pos_a = context.find("a.txt").expect("a.txt presente");
+        let pos_b = context.find("b.txt").expect("b.txt presente");
+        assert!(pos_a < pos_b, "a.txt debe ir antes que b.txt: {context}");
+    }
+
+    #[test]
+    fn compose_context_empty_is_empty() {
+        assert_eq!(compose_context(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn read_files_reads_contents_in_order() {
+        let a = temp_path("a.txt");
+        let b = temp_path("b.txt");
+        std::fs::write(&a, "contenido A").expect("write a");
+        std::fs::write(&b, "contenido B").expect("write b");
+
+        let files = read_files(&[a.clone(), b.clone()])
+            .await
+            .expect("lectura correcta");
+
+        assert_eq!(files.len(), 2);
+        assert!(files[0].0.ends_with("a.txt"), "ruta 0: {}", files[0].0);
+        assert_eq!(files[0].1, "contenido A");
+        assert_eq!(files[1].1, "contenido B");
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[tokio::test]
+    async fn read_files_missing_file_is_attachment_error() {
+        let missing = temp_path("no-existe.txt");
+        let err = read_files(&[missing]).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_files_non_utf8_is_attachment_error() {
+        let path = temp_path("bin.dat");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("write bin");
+        let err = read_files(std::slice::from_ref(&path)).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- attachments spec: Imágenes multimodales ---
+
+    #[tokio::test]
+    async fn read_images_encodes_base64_and_mime() {
+        let path = temp_path("foto.png");
+        std::fs::write(&path, b"PNGDATA").expect("write png");
+
+        let images = read_images(std::slice::from_ref(&path))
+            .await
+            .expect("lectura imagen");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].data, "UE5HREFUQQ==");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn read_images_missing_file_is_attachment_error() {
+        let missing = temp_path("no-existe.png");
+        let err = read_images(&[missing]).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_images_unknown_extension_is_attachment_error() {
+        let path = temp_path("documento.pdf");
+        std::fs::write(&path, b"%PDF").expect("write pdf");
+        let err = read_images(std::slice::from_ref(&path)).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mime_from_path_recognizes_supported_extensions() {
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.png")).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.jpg")).unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.JPEG")).unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.gif")).unwrap(),
+            "image/gif"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.webp")).unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[test]
+    fn mime_from_path_unknown_extension_is_error() {
+        let err = mime_from_path(&PathBuf::from("a.bmp")).unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn apply_overrides_does_not_rewrite_config_file() {
+        let path = temp_yaml_path();
+        let original = "model: gpt-3.5-turbo\ntemperature: 1.0\nprovider: openai\n";
+        std::fs::write(&path, original).expect("write temp yaml");
+
+        let mut bot = IABot::read_content(&path).await.expect("read_content");
+        bot.apply_overrides(
+            Some("gpt-4o".to_string()),
+            Some(0.2),
+            Some("ollama".to_string()),
+        )
+        .expect("overrides válidos");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, original, "el fichero no debe reescribirse");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- command spec: limpieza del comando devuelto por el modelo ---
+
+    #[test]
+    fn clean_command_without_fences_is_trimmed() {
+        assert_eq!(clean_command("  ls -l  "), "ls -l");
+        assert_eq!(clean_command("ls -l"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_bash_fence() {
+        assert_eq!(clean_command("```bash\nls -l\n```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_plain_fence() {
+        assert_eq!(
+            clean_command("```\nfind . -name '*.log'\n```"),
+            "find . -name '*.log'"
+        );
+    }
+
+    #[test]
+    fn clean_command_strips_fence_with_trailing_newline() {
+        assert_eq!(clean_command("```sh\nls -l\n```\n"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_single_line_fence() {
+        assert_eq!(clean_command("```ls -l```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_wrapping_single_backticks() {
+        assert_eq!(clean_command("`touch /tmp/x`"), "touch /tmp/x");
+        assert_eq!(clean_command("  `ls -l`  "), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_keeps_multiple_inline_substitutions_intact() {
+        // Dos sustituciones distintas: recortar el par exterior corrompería el
+        // comando y `sh -c` fallaría con un error de sintaxis.
+        assert_eq!(clean_command("`which ls` && `pwd`"), "`which ls` && `pwd`");
+    }
+
+    #[test]
+    fn clean_command_keeps_legitimate_internal_backticks() {
+        assert_eq!(clean_command("echo `date`"), "echo `date`");
+        assert_eq!(
+            clean_command("mkdir -p `dirname \"/tmp/a b\"`"),
+            "mkdir -p `dirname \"/tmp/a b\"`"
+        );
+        // Doble backtick envolvente no se toca (no es un par simple).
+        assert_eq!(clean_command("``cmd``"), "``cmd``");
+    }
+
+    #[test]
+    fn clean_command_strips_single_line_fence_with_language() {
+        assert_eq!(clean_command("```bash touch /tmp/x```"), "touch /tmp/x");
+        assert_eq!(clean_command("```console exit 3```"), "exit 3");
+        assert_eq!(clean_command("```zsh ls -l```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_keeps_language_word_when_command_starts_with_flag() {
+        // `bash -c "echo hi"` es un comando válido: no debe mutarse a `-c ...`.
+        assert_eq!(
+            clean_command("```bash -c \"echo hi\"```"),
+            "bash -c \"echo hi\""
+        );
+    }
+
+    #[test]
+    fn clean_command_keeps_language_word_when_command_starts_with_path() {
+        assert_eq!(clean_command("```sh ./script.sh```"), "sh ./script.sh");
+    }
+
+    #[test]
+    fn clean_command_language_only_fence_is_empty() {
+        // Un fence que sólo contiene el lenguaje no es un comando: con
+        // `--exec --yes` abriría un shell interactivo.
+        assert_eq!(clean_command("```bash```"), "");
+    }
+
+    #[test]
+    fn clean_command_extracts_first_block_ignoring_prose() {
+        assert_eq!(clean_command("Aquí tienes:\n```bash\nls -l\n```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_empty_stays_empty() {
+        assert_eq!(clean_command(""), "");
+        assert_eq!(clean_command("   \n  "), "");
+    }
+
+    #[test]
+    fn clean_command_preserves_inner_newlines_of_a_command() {
+        assert_eq!(
+            clean_command("```bash\nif true; then\n  echo hola\nfi\n```"),
+            "if true; then\n  echo hola\nfi"
+        );
+    }
+
+    #[test]
+    fn command_system_role_asks_only_for_the_command() {
+        let role = COMMAND_SYSTEM_ROLE.to_lowercase();
+        assert!(
+            role.contains("únicamente") || role.contains("unicamente"),
+            "rol: {role}"
+        );
+        assert!(role.contains("comando"), "rol: {role}");
     }
 }

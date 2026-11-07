@@ -1,7 +1,11 @@
 mod ia;
 
-use clap::Parser;
-use ia::IABot;
+use clap::{CommandFactory, Parser, ValueEnum};
+use ia::{
+    clean_command, compose_context, compose_user_message, read_files, read_images, ChatResponse,
+    IABot, IABotError, COMMAND_SYSTEM_ROLE,
+};
+use std::io::{self, IsTerminal, Read, Write};
 use std::{env, str::FromStr};
 use std::{path::PathBuf, process};
 use tracing::{error, info};
@@ -11,26 +15,381 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Instructions of ChatGPT behaivur
-    #[arg(short, long)]
+    /// Instructions of ChatGPT behaivur (alias: --system)
+    #[arg(short, long, alias = "system")]
     instructions: Option<String>,
+
+    /// Sobreescribe `model` de `dime.yml` sólo para esta invocación
+    #[arg(long = "model")]
+    model: Option<String>,
+
+    /// Sobreescribe `temperature` de `dime.yml` sólo para esta invocación
+    #[arg(long = "temperature")]
+    temperature: Option<f64>,
+
+    /// Sobreescribe `provider` (`openai`/`ollama`) sólo para esta invocación
+    #[arg(long = "provider")]
+    provider: Option<String>,
 
     /// Question for ChatGPT
     #[arg(short = 'q', long = "question", conflicts_with = "question")]
     question_flag: Option<String>,
 
     /// Question for ChatGPT
-    #[arg(value_name = "QUESTION", required_unless_present_any = ["question_flag", "list_models"])]
+    #[arg(value_name = "QUESTION")]
     question: Option<String>,
 
     /// Lista los modelos disponibles del proveedor y termina
     #[arg(long = "list-models", conflicts_with_all = ["question_flag", "question"])]
     list_models: bool,
+
+    /// Emite la respuesta como un único objeto JSON en stdout (content, model, usage)
+    #[arg(long = "json", conflicts_with = "list_models")]
+    json: bool,
+
+    /// Garantiza que la salida no contiene secuencias de escape ANSI
+    #[arg(long = "no-color")]
+    no_color: bool,
+
+    /// Adjunta el contenido de un fichero como contexto del mensaje (repetible)
+    #[arg(long = "file", value_name = "RUTA")]
+    files: Vec<PathBuf>,
+
+    /// Adjunta una imagen multimodal (repetible); formato png, jpg, jpeg, gif o webp
+    #[arg(long = "image", value_name = "RUTA")]
+    images: Vec<PathBuf>,
+
+    /// Copia la respuesta al portapapeles además de imprimirla (best-effort)
+    #[arg(long = "copy")]
+    copy: bool,
+
+    /// Imprime el script de autocompletado del shell indicado y termina
+    ///
+    /// No exige pregunta, no lee `stdin` y no requiere (ni crea) `dime.yml`.
+    #[arg(
+        long = "completions",
+        value_name = "SHELL",
+        value_enum,
+        conflicts_with_all = ["question", "question_flag", "list_models"]
+    )]
+    completions: Option<CompletionShell>,
+
+    /// Pide al modelo únicamente el comando de shell que cumple el objetivo
+    ///
+    /// Imprime el comando limpio (sin fences de Markdown ni explicaciones) y NO
+    /// lo ejecuta salvo que se pase `--exec`. No usa `stdin` como contexto.
+    #[arg(
+        long = "cmd",
+        value_name = "OBJETIVO",
+        conflicts_with_all = ["question", "question_flag", "list_models", "completions"]
+    )]
+    cmd: Option<String>,
+
+    /// Ejecuta el comando generado tras una confirmación interactiva (requiere `--cmd`)
+    ///
+    /// La confirmación por defecto es NEGATIVA. Si `stdin` no es un TTY y no se
+    /// pasa `--yes`, el comando no se ejecuta y el proceso termina con código
+    /// distinto de cero.
+    #[arg(long = "exec", requires = "cmd")]
+    exec: bool,
+
+    /// Ejecuta el comando sin pedir confirmación (requiere `--cmd`)
+    ///
+    /// Sólo tiene efecto junto con `--exec`: sin `--exec` nunca se ejecuta nada.
+    #[arg(long = "yes", requires = "cmd")]
+    yes: bool,
+}
+
+/// Shell soportado por `--completions`.
+///
+/// Se limita a los tres shells del plan (bash, zsh, fish). El resto de shells de
+/// `clap_complete` (elvish, powershell) no se exponen todavía; un valor fuera de
+/// este conjunto produce un error de uso de `clap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(shell: CompletionShell) -> Self {
+        match shell {
+            CompletionShell::Bash => clap_complete::Shell::Bash,
+            CompletionShell::Zsh => clap_complete::Shell::Zsh,
+            CompletionShell::Fish => clap_complete::Shell::Fish,
+        }
+    }
+}
+
+/// Escribe en `writer` el script de autocompletado de `dime` para `shell`.
+///
+/// Toda la E/S va al `writer` recibido, de modo que la generación pueda testearse
+/// con un buffer en memoria sin depender del binario ni de `stdout`.
+fn generate_completions(shell: CompletionShell, writer: &mut dyn Write) {
+    let mut command = Args::command();
+    let shell: clap_complete::Shell = shell.into();
+    clap_complete::generate(shell, &mut command, "dime", writer);
+}
+
+/// Estado de la entrada estándar en el momento de resolver la pregunta.
+///
+/// Se modela explícitamente para no leer nunca de un `stdin` interactivo y
+/// para poder decidir la fuente de la pregunta con una función pura y testeable.
+#[derive(Debug, PartialEq, Eq)]
+enum StdinState<'a> {
+    /// `stdin` es un TTY (uso interactivo): nunca se lee.
+    Tty,
+    /// `stdin` no es un TTY y no aporta datos (EOF inmediato).
+    Empty,
+    /// `stdin` no es un TTY y aporta estos datos.
+    Data(&'a str),
+}
+
+/// Resultado de resolver la entrada del usuario a partir de los argumentos y de
+/// `stdin`.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedInput {
+    /// Pregunta simple, sin contexto adicional.
+    Question(String),
+    /// Pregunta más contexto leído de `stdin`.
+    QuestionWithContext { question: String, context: String },
+}
+
+/// Decide la fuente de la pregunta y del contexto a partir de la pregunta
+/// aportada por argumentos y del estado de `stdin`.
+///
+/// Es una función pura: no toca `stdin` ni el sistema de archivos.
+fn resolve_input(
+    question_arg: Option<&str>,
+    stdin: StdinState<'_>,
+) -> Result<ResolvedInput, IABotError> {
+    match stdin {
+        // Uso interactivo: nunca se lee de stdin. Sólo vale una pregunta real
+        // (el marcador `-` implicaría leer de un terminal interactivo).
+        StdinState::Tty => match question_arg {
+            Some(question) if question != "-" => Ok(ResolvedInput::Question(question.to_string())),
+            _ => Err(IABotError::Input(
+                "no se ha proporcionado ninguna pregunta; usa -q/posicional o canaliza la entrada por stdin"
+                    .to_string(),
+            )),
+        },
+        // Sin datos y sin pregunta no hay nada que enviar.
+        StdinState::Empty => match question_arg {
+            Some(question) if question != "-" => Ok(ResolvedInput::Question(question.to_string())),
+            _ => Err(IABotError::Input(
+                "stdin está vacío y no se ha proporcionado ninguna pregunta".to_string(),
+            )),
+        },
+        // Con datos: la pregunta sale de stdin (sin argumento o con `-`) o bien
+        // se usa el argumento como pregunta y stdin como contexto.
+        StdinState::Data(data) => match question_arg {
+            Some("-") | None => Ok(ResolvedInput::Question(data.trim().to_string())),
+            Some(question) => Ok(ResolvedInput::QuestionWithContext {
+                question: question.to_string(),
+                context: data.trim_end().to_string(),
+            }),
+        },
+    }
+}
+
+/// Compone el texto de usuario final: pregunta más contexto de `stdin` más el
+/// contexto de los ficheros adjuntos, en ese orden.
+///
+/// El bloque de ficheros se añade DESPUÉS del contexto de `stdin` (respetando el
+/// orden de `--file`). Sin ficheros equivale a [`compose_user_message`].
+fn compose_user_text(
+    question: &str,
+    stdin_context: Option<&str>,
+    files: &[(String, String)],
+) -> String {
+    let base = compose_user_message(question, stdin_context);
+    let context = compose_context(files);
+    if context.is_empty() {
+        base
+    } else {
+        format!("{base}\n\n{context}")
+    }
+}
+
+/// Ejecuta el modo comando (`--cmd`) y devuelve el código de salida de `dime`.
+///
+/// Pide al modelo únicamente el comando, lo imprime limpio y, sólo si procede
+/// (`--exec` y confirmación o `--yes`), lo ejecuta con `sh -c`. **Sin `--exec`
+/// nunca se ejecuta nada.** Un `stdin` que no es TTY sin `--yes` aborta con
+/// código distinto de cero en lugar de ejecutar a ciegas.
+async fn run_command_mode(iabot: &IABot, args: &Args, objective: &str) -> i32 {
+    // En modo comando el rol por defecto pide SÓLO el comando; `--instructions`
+    // sigue pudiendo sobreescribirlo, igual que en el modo pregunta.
+    let system_role = args.instructions.as_deref().unwrap_or(COMMAND_SYSTEM_ROLE);
+
+    let files = match read_files(&args.files).await {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let images = match read_images(&args.images).await {
+        Ok(images) => images,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+
+    let user_text = compose_user_text(objective, None, &files);
+
+    let response = match iabot.ask(system_role, &user_text, &images).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            error!("{}", e);
+            return 1;
+        }
+    };
+
+    let command = clean_command(&response.content);
+    if command.is_empty() {
+        eprintln!("Error: el modelo no devolvió ningún comando");
+        return 1;
+    }
+
+    // El comando SIEMPRE se muestra antes de cualquier posible ejecución.
+    println!("{command}");
+    let _ = io::stdout().flush();
+
+    if !args.exec {
+        return 0;
+    }
+
+    let stdin_is_tty = io::stdin().is_terminal();
+    // Sólo se pregunta cuando hay `--exec`, no hay `--yes` y se puede
+    // interactuar; el resto de casos los decide `should_execute`.
+    let confirmed = if args.exec && !args.yes && stdin_is_tty {
+        match confirm_execution(&command) {
+            Ok(confirmed) => confirmed,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+        }
+    } else {
+        false
+    };
+
+    if !should_execute(args.exec, args.yes, stdin_is_tty, confirmed) {
+        if !args.yes && !stdin_is_tty {
+            eprintln!(
+                "Error: no se puede pedir confirmación porque stdin no es un TTY; usa --yes para ejecutar sin confirmación"
+            );
+            return 1;
+        }
+        eprintln!("Comando no ejecutado.");
+        return 0;
+    }
+
+    match execute_command(&command) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            1
+        }
+    }
+}
+
+/// Decide si hay que ejecutar el comando. Es una función pura.
+///
+/// Reglas de seguridad:
+/// - Sin `exec` (`--exec`) **nunca** se ejecuta.
+/// - Con `yes` (`--yes`) se ejecuta sin confirmación.
+/// - Sin `--yes` se exige un `stdin` interactivo (TTY) y una confirmación
+///   afirmativa explícita.
+fn should_execute(exec: bool, yes: bool, stdin_is_tty: bool, confirmed: bool) -> bool {
+    exec && (yes || (stdin_is_tty && confirmed))
+}
+
+/// Interpreta la respuesta a la confirmación. Por defecto es **negativa**.
+///
+/// Sólo `y`, `yes`, `s`, `si` y `sí` (sin distinguir mayúsculas y admitiendo
+/// espacios) confirman; el vacío y cualquier otra respuesta no ejecutan.
+fn is_confirmation(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes" | "s" | "si" | "sí"
+    )
+}
+
+/// Pide confirmación por `stderr`/`stdin`; por defecto NO ejecuta.
+fn confirm_execution(command: &str) -> Result<bool, IABotError> {
+    {
+        let stderr = io::stderr();
+        let mut handle = stderr.lock();
+        let _ = write!(handle, "¿Ejecutar `{command}`? [y/N] ");
+        let _ = handle.flush();
+    }
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| IABotError::Input(format!("no se pudo leer la confirmación: {e}")))?;
+
+    Ok(is_confirmation(&answer))
+}
+
+/// Ejecuta `command` con `sh -c` (heredando `stdout`/`stderr`).
+///
+/// Devuelve el código de salida del hijo para propagarlo como código de `dime`.
+/// Un fallo al lanzar el shell es [`IABotError::Execution`], nunca un *panic*.
+fn execute_command(command: &str) -> Result<i32, IABotError> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .map_err(|e| IABotError::Execution(e.to_string()))?;
+
+    Ok(exit_code(status))
+}
+
+/// Código de salida a propagar por un proceso terminado.
+///
+/// Si el hijo terminó normalmente se propaga su código. Si terminó por señal se
+/// usa la convención de los shells (`128 + señal`), de modo que un hijo abortado
+/// nunca se confunde con un éxito (`0`).
+fn exit_code(status: process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    1
 }
 
 #[tokio::main]
 async fn main() {
     info!("main");
+
+    // Se parsean los argumentos antes de tocar el fichero de configuración:
+    // `--help`/`--version` no deben crear ni leer `dime.yml`, y un error de uso
+    // (p. ej. `--temperature` no numérica) termina sin realizar ninguna petición.
+    let mut args = Args::parse();
+
+    // `--completions` no exige pregunta, no lee `stdin` ni toca la configuración:
+    // se atiende antes de resolver/crear `dime.yml` y antes de leer la entrada.
+    if let Some(shell) = args.completions {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        generate_completions(shell, &mut handle);
+        let _ = handle.flush();
+        return;
+    }
 
     let config = match get_config() {
         Some(path) => path,
@@ -51,7 +410,7 @@ async fn main() {
         }
     };
 
-    let iabot = match IABot::read_content(&config).await {
+    let mut iabot = match IABot::read_content(&config).await {
         Ok(bot) => bot,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -59,20 +418,38 @@ async fn main() {
         }
     };
 
+    // Los overrides se aplican ANTES de `validate()` (con `--provider ollama`
+    // no se exige token) y sin reescribir `dime.yml`.
+    if let Err(e) = iabot.apply_overrides(
+        args.model.take(),
+        args.temperature.take(),
+        args.provider.take(),
+    ) {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
+
     if let Err(e) = iabot.validate() {
         eprintln!("Error: {e} (fichero {})", config.display());
         process::exit(1);
     }
 
+    // El logging nunca debe contaminar `stdout`, reservado para la respuesta
+    // (`--json` o el contenido). El color del log se decide por su destino real:
+    // sólo ANSI cuando `stderr` es un TTY y no se pasa `--no-color`.
     let filter =
         EnvFilter::from_str(iabot.get_log_level()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = should_colorize(args.no_color, std::io::stderr().is_terminal());
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi),
+        )
         .init();
 
-    let args = Args::parse();
-
+    // `--list-models` ignora por completo `stdin`: se resuelve antes de tocarlo.
     if args.list_models {
         match iabot.list_models().await {
             Ok(models) => {
@@ -89,18 +466,85 @@ async fn main() {
         return;
     }
 
+    // `--cmd` es el modo comando: no usa `stdin` como contexto (lo reserva para
+    // la confirmación de `--exec`) y termina con el código de salida del comando
+    // ejecutado, o `0` si sólo se imprime.
+    if let Some(objective) = args.cmd.as_deref() {
+        let code = run_command_mode(&iabot, &args, objective).await;
+        process::exit(code);
+    }
+
     let system_role = args
         .instructions
         .as_deref()
         .unwrap_or_else(|| iabot.get_system_role());
-    let Some(question) = args.question_flag.as_deref().or(args.question.as_deref()) else {
-        eprintln!("Error: no se ha proporcionado ninguna pregunta");
-        process::exit(1);
+
+    // Sólo se lee `stdin` cuando NO es un TTY; en modo interactivo nunca se
+    // bloquea la ejecución esperando datos.
+    let stdin_data = if io::stdin().is_terminal() {
+        None
+    } else {
+        match read_stdin() {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+    };
+    let stdin_state = match stdin_data.as_deref() {
+        None => StdinState::Tty,
+        Some(data) if data.trim().is_empty() => StdinState::Empty,
+        Some(data) => StdinState::Data(data),
     };
 
-    match iabot.ask(system_role, question).await {
+    let question_arg = args.question_flag.as_deref().or(args.question.as_deref());
+    let resolved = match resolve_input(question_arg, stdin_state) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let (question, stdin_context) = match resolved {
+        ResolvedInput::Question(question) => (question, None),
+        ResolvedInput::QuestionWithContext { question, context } => (question, Some(context)),
+    };
+
+    // Los adjuntos se leen antes de la petición: un fichero o una imagen
+    // ilegible termina con código distinto de cero sin contactar al proveedor.
+    let files = match read_files(&args.files).await {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+    let images = match read_images(&args.images).await {
+        Ok(images) => images,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let user_text = compose_user_text(&question, stdin_context.as_deref(), &files);
+
+    // En X11 sin *clipboard manager*, el proceso es el dueño del contenido: hay
+    // que mantener el handle vivo hasta el final de `main` para no perderlo.
+    let mut clipboard_guard: Option<arboard::Clipboard> = None;
+
+    match iabot.ask(system_role, &user_text, &images).await {
         Ok(response) => {
-            println!("{}", response)
+            println!("{}", render_output(&response, args.json, iabot.get_model()));
+            if args.copy {
+                // Best-effort: un fallo del portapapeles sólo advierte por stderr.
+                let stderr = io::stderr();
+                let mut handle = stderr.lock();
+                clipboard_guard =
+                    report_copy_result(copy_to_clipboard(&clipboard_text(&response)), &mut handle);
+            }
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -108,6 +552,105 @@ async fn main() {
             process::exit(1);
         }
     }
+
+    // El guardián del portapapeles se suelta aquí, al final de `main`.
+    drop(clipboard_guard);
+}
+
+/// Lee todo `stdin` como texto UTF-8.
+///
+/// Capa fina sobre la entrada estándar; las decisiones sobre qué hacer con los
+/// datos viven en [`resolve_input`], que es pura y testeable.
+fn read_stdin() -> Result<String, IABotError> {
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|e| IABotError::Input(format!("no se pudo leer de stdin: {e}")))?;
+    Ok(buffer)
+}
+
+/// Compone la salida que se escribe en `stdout`.
+///
+/// Con `json = true` devuelve exactamente un objeto JSON compacto con las claves
+/// `content`, `model` y `usage`. `model` es siempre una cadena: el modelo
+/// informado por el proveedor si está presente y `default_model` en caso
+/// contrario; `usage` es `null` si no se aporta. Con `json = false` devuelve el
+/// contenido tal cual, sin alterarlo. En ningún caso emite secuencias de escape
+/// ANSI.
+fn render_output(response: &ChatResponse, json: bool, default_model: &str) -> String {
+    if json {
+        serde_json::json!({
+            "content": response.content,
+            "model": response.model.as_deref().unwrap_or(default_model),
+            "usage": response.usage,
+        })
+        .to_string()
+    } else {
+        response.content.clone()
+    }
+}
+
+/// Copia `text` al portapapeles del sistema y devuelve el handle vivo.
+///
+/// Es *best-effort*: devuelve [`IABotError::Clipboard`] si el portapapeles no
+/// está disponible (p. ej. entorno *headless*), sin *panic*.
+///
+/// El [`arboard::Clipboard`] **se devuelve** en lugar de soltarse aquí: en X11
+/// sin *clipboard manager* el proceso es el dueño del contenido y soltar el
+/// handle inmediatamente tras `set_text` perdería el texto. El llamante debe
+/// mantenerlo vivo hasta el final de `main`.
+pub fn copy_to_clipboard(text: &str) -> Result<arboard::Clipboard, IABotError> {
+    copy_to_clipboard_with(text, |text| {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        clipboard.set_text(text).map_err(|e| e.to_string())?;
+        Ok(clipboard)
+    })
+}
+
+/// Variante de [`copy_to_clipboard`] con la escritura inyectada.
+///
+/// Es genérica sobre el valor de éxito: propaga el valor que devuelve `write`
+/// (el handle del portapapeles real en producción) para que el llamante pueda
+/// conservarlo vivo. También permite testear de forma determinista el camino de
+/// error sin depender de un portapapeles real.
+fn copy_to_clipboard_with<T, F>(text: &str, write: F) -> Result<T, IABotError>
+where
+    F: FnOnce(&str) -> Result<T, String>,
+{
+    write(text).map_err(IABotError::Clipboard)
+}
+
+/// Texto que se copia al portapapeles con `--copy`.
+///
+/// Es siempre el campo `content` de la respuesta: en modo `--json` se copia ese
+/// campo (no el objeto JSON completo) y en modo normal coincide con el texto
+/// impreso.
+fn clipboard_text(response: &ChatResponse) -> String {
+    response.content.clone()
+}
+
+/// Advierte por `warn` si la copia falló y propaga el guardián del portapapeles.
+///
+/// El comando nunca falla por un portapapeles no disponible: sólo advierte. En
+/// éxito devuelve `Some(guard)` para que el llamante lo mantenga vivo.
+fn report_copy_result<T>(result: Result<T, IABotError>, warn: &mut dyn Write) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let _ = writeln!(warn, "Aviso: {e}");
+            None
+        }
+    }
+}
+
+/// Decide si la salida de diagnóstico puede llevar color.
+///
+/// Sólo cuando el destino (`stderr`) es un TTY y no se pasa `--no-color`. Se usa
+/// para configurar `with_ansi` del layer de `tracing`, de modo que nunca se
+/// emiten secuencias de escape ANSI cuando la salida está canalizada o
+/// redirigida.
+fn should_colorize(no_color: bool, stderr_is_terminal: bool) -> bool {
+    !no_color && stderr_is_terminal
 }
 
 /// Construye, en orden, los posibles emplazamientos de `dime.yml` según la
@@ -212,9 +755,11 @@ mod tests {
     }
 
     #[test]
-    fn question_is_required_without_list_models() {
-        let err = Args::try_parse_from(["dime"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn question_is_optional_in_clap() {
+        let args = Args::try_parse_from(["dime"]).expect("debe parsear sin pregunta");
+        assert!(!args.list_models);
+        assert!(args.question.is_none());
+        assert!(args.question_flag.is_none());
     }
 
     #[test]
@@ -241,5 +786,563 @@ mod tests {
     fn list_models_conflicts_with_question_flag() {
         let err = Args::try_parse_from(["dime", "--list-models", "-q", "hola"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // --- stdin-input spec: Entrada desde stdin ---
+
+    #[test]
+    fn scenario_question_only_from_stdin() {
+        let resolved = resolve_input(None, StdinState::Data("hola\n")).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn scenario_dash_marker_forces_stdin() {
+        let resolved = resolve_input(Some("-"), StdinState::Data("hola\n")).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn scenario_question_plus_context_from_stdin() {
+        let resolved = resolve_input(Some("resume"), StdinState::Data("diff --git a b\n"))
+            .expect("debe resolver");
+        let ResolvedInput::QuestionWithContext { question, context } = resolved else {
+            panic!("esperado QuestionWithContext");
+        };
+        let message = compose_user_message(&question, Some(&context));
+        assert!(message.contains("resume"), "mensaje: {message}");
+        assert!(message.contains("diff --git a b"), "mensaje: {message}");
+    }
+
+    #[test]
+    fn scenario_stdin_without_data_or_question_errors() {
+        let err = resolve_input(None, StdinState::Empty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn scenario_tty_without_question_is_usage_error() {
+        let err = resolve_input(None, StdinState::Tty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn tty_with_question_does_not_use_stdin() {
+        let resolved = resolve_input(Some("hola"), StdinState::Tty).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn empty_stdin_with_question_is_plain_question() {
+        let resolved = resolve_input(Some("hola"), StdinState::Empty).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn dash_marker_with_empty_stdin_errors() {
+        let err = resolve_input(Some("-"), StdinState::Empty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn compose_user_message_without_context_is_question() {
+        assert_eq!(compose_user_message("hola", None), "hola");
+    }
+
+    #[test]
+    fn compose_user_message_ignores_blank_context() {
+        assert_eq!(compose_user_message("hola", Some("   \n")), "hola");
+    }
+
+    // --- output spec: Salida JSON ---
+
+    fn chat_response() -> ChatResponse {
+        ChatResponse {
+            content: "Hola".to_string(),
+            model: Some("gpt-4o".to_string()),
+            usage: Some(serde_json::json!({"prompt_tokens": 5})),
+        }
+    }
+
+    #[test]
+    fn render_json_has_content_model_and_usage() {
+        let out = render_output(&chat_response(), true, "gpt-3.5-turbo");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(value["content"], "Hola");
+        assert_eq!(value["model"], "gpt-4o");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+    }
+
+    #[test]
+    fn render_json_without_usage_is_null_and_model_falls_back() {
+        let response = ChatResponse {
+            content: "Hola".to_string(),
+            model: None,
+            usage: None,
+        };
+        let out = render_output(&response, true, "gpt-3.5-turbo");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(value["model"], "gpt-3.5-turbo");
+        assert!(value["usage"].is_null());
+    }
+
+    #[test]
+    fn render_default_is_plain_content() {
+        assert_eq!(
+            render_output(&chat_response(), false, "gpt-3.5-turbo"),
+            "Hola"
+        );
+    }
+
+    // --- output spec: Control de color ---
+
+    #[test]
+    fn render_never_emits_ansi() {
+        for json in [true, false] {
+            let out = render_output(&chat_response(), json, "gpt-3.5-turbo");
+            assert!(!out.contains('\u{1b}'), "ANSI inesperado: {out:?}");
+        }
+    }
+
+    #[test]
+    fn should_colorize_requires_tty_and_no_no_color() {
+        assert!(!should_colorize(true, true));
+        assert!(!should_colorize(true, false));
+        assert!(!should_colorize(false, false));
+        assert!(should_colorize(false, true));
+    }
+
+    // --- output spec: flags ---
+
+    #[test]
+    fn json_and_no_color_flags_parse() {
+        let args = Args::try_parse_from(["dime", "--json", "--no-color", "hola"]).expect("parse");
+        assert!(args.json);
+        assert!(args.no_color);
+        assert_eq!(args.question.as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn json_and_no_color_default_to_false() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(!args.json);
+        assert!(!args.no_color);
+    }
+
+    #[test]
+    fn json_conflicts_with_list_models() {
+        let err = Args::try_parse_from(["dime", "--json", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // --- cli-overrides spec: flags de override ---
+
+    #[test]
+    fn override_flags_default_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(args.model.is_none());
+        assert!(args.temperature.is_none());
+        assert!(args.provider.is_none());
+    }
+
+    #[test]
+    fn override_flags_parse() {
+        let args = Args::try_parse_from([
+            "dime",
+            "--model",
+            "gpt-4o",
+            "--temperature",
+            "0.2",
+            "--provider",
+            "ollama",
+            "hola",
+        ])
+        .expect("parse");
+        assert_eq!(args.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(args.temperature, Some(0.2));
+        assert_eq!(args.provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn system_is_alias_of_instructions() {
+        let args = Args::try_parse_from(["dime", "--system", "eres un experto", "-q", "hola"])
+            .expect("parse");
+        assert_eq!(args.instructions.as_deref(), Some("eres un experto"));
+    }
+
+    #[test]
+    fn temperature_non_numeric_is_usage_error() {
+        let err = Args::try_parse_from(["dime", "--temperature", "alta", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    // --- completions spec: Generación de scripts de completado ---
+
+    #[test]
+    fn completions_flag_parses_each_supported_shell() {
+        for (arg, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+        ] {
+            let args = Args::try_parse_from(["dime", "--completions", arg]).expect("debe parsear");
+            assert_eq!(args.completions, Some(expected));
+        }
+    }
+
+    #[test]
+    fn completions_defaults_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("debe parsear");
+        assert!(args.completions.is_none());
+    }
+
+    #[test]
+    fn completions_rejects_unsupported_shell() {
+        let err = Args::try_parse_from(["dime", "--completions", "elvish"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn completions_conflicts_with_question_flag() {
+        let err =
+            Args::try_parse_from(["dime", "--completions", "bash", "-q", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn completions_conflicts_with_positional_question() {
+        let err = Args::try_parse_from(["dime", "--completions", "bash", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn completions_conflicts_with_list_models() {
+        let err =
+            Args::try_parse_from(["dime", "--completions", "bash", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn generate_completions_writes_script_naming_binary() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            generate_completions(shell, &mut buf);
+            let script = String::from_utf8(buf).expect("script UTF-8");
+            assert!(!script.trim().is_empty(), "script vacío para {shell:?}");
+            assert!(script.contains("dime"), "script sin `dime` para {shell:?}");
+        }
+    }
+
+    // --- attachments spec: flags ---
+
+    #[test]
+    fn file_flag_is_repeatable() {
+        let args = Args::try_parse_from(["dime", "--file", "a.txt", "--file", "b.txt", "hola"])
+            .expect("parse");
+        assert_eq!(
+            args.files,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
+    }
+
+    #[test]
+    fn image_flag_is_repeatable() {
+        let args = Args::try_parse_from(["dime", "--image", "a.png", "--image", "b.jpg", "hola"])
+            .expect("parse");
+        assert_eq!(
+            args.images,
+            vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")]
+        );
+    }
+
+    #[test]
+    fn file_and_image_flags_default_to_empty() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(args.files.is_empty());
+        assert!(args.images.is_empty());
+    }
+
+    // --- attachments spec: Composición del mensaje de usuario ---
+
+    #[test]
+    fn compose_user_text_without_files_is_question_with_stdin_context() {
+        let text = compose_user_text("resume", Some("stdin ctx"), &[]);
+        assert_eq!(text, "resume\n\nstdin ctx");
+    }
+
+    #[test]
+    fn compose_user_text_without_context_or_files_is_plain_question() {
+        assert_eq!(compose_user_text("resume", None, &[]), "resume");
+    }
+
+    #[test]
+    fn compose_user_text_appends_files_after_stdin_context() {
+        let files = vec![("a.txt".to_string(), "contenido A".to_string())];
+        let text = compose_user_text("resume", Some("stdin ctx"), &files);
+        let pos_question = text.find("resume").expect("pregunta");
+        let pos_stdin = text.find("stdin ctx").expect("stdin");
+        let pos_file = text.find("contenido A").expect("fichero");
+        assert!(pos_question < pos_stdin, "texto: {text}");
+        assert!(
+            pos_stdin < pos_file,
+            "el fichero debe ir tras stdin: {text}"
+        );
+    }
+
+    // --- clipboard spec: flags ---
+
+    #[test]
+    fn copy_flag_parses_and_defaults_to_false() {
+        let args = Args::try_parse_from(["dime", "--copy", "hola"]).expect("parse");
+        assert!(args.copy);
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(!args.copy);
+    }
+
+    // --- clipboard spec: Copia best-effort ---
+
+    #[test]
+    fn copy_to_clipboard_with_success_records_text() {
+        let mut captured = String::new();
+        copy_to_clipboard_with("respuesta", |text| {
+            captured = text.to_string();
+            Ok(())
+        })
+        .expect("copia correcta");
+        assert_eq!(captured, "respuesta");
+    }
+
+    #[test]
+    fn copy_to_clipboard_with_returns_guard_from_writer() {
+        // El guardián (p. ej. el `Clipboard` vivo) debe propagarse al llamante
+        // para que NO se libere dentro del helper: en X11 sin clipboard manager,
+        // soltar el `Clipboard` de inmediato pierde el contenido.
+        let guard = copy_to_clipboard_with("respuesta", |_| Ok("GUARD")).expect("copia correcta");
+        assert_eq!(guard, "GUARD");
+    }
+
+    #[test]
+    fn report_copy_result_returns_guard_on_success() {
+        let mut buf: Vec<u8> = Vec::new();
+        let guard = report_copy_result(Ok("GUARD"), &mut buf);
+        assert_eq!(guard, Some("GUARD"));
+        assert!(buf.is_empty(), "no debe advertir en éxito");
+    }
+
+    #[test]
+    fn clipboard_text_is_content_field_not_json_object() {
+        let response = chat_response();
+        let json_output = render_output(&response, true, "gpt-3.5-turbo");
+        assert!(json_output.starts_with('{'), "salida JSON: {json_output}");
+        assert_eq!(clipboard_text(&response), "Hola");
+    }
+
+    #[test]
+    fn copy_to_clipboard_with_failure_returns_clipboard_error() {
+        let err =
+            copy_to_clipboard_with::<(), _>("respuesta", |_| Err("sin portapapeles".to_string()))
+                .unwrap_err();
+        assert!(matches!(err, IABotError::Clipboard(_)), "err: {err}");
+        assert!(err.to_string().contains("sin portapapeles"), "err: {err}");
+    }
+
+    #[test]
+    fn report_copy_result_success_writes_nothing() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_copy_result::<()>(Ok(()), &mut buf);
+        assert!(buf.is_empty(), "no debe advertir en éxito");
+    }
+
+    /// Roundtrip real con el portapapeles del sistema.
+    ///
+    /// Se marca `#[ignore]` porque requiere un portapapeles real (no hay uno en
+    /// CI/entornos *headless*). Se ejecuta a mano con `cargo test -- --ignored`
+    /// para demostrar que el guardián devuelto por [`copy_to_clipboard`] mantiene
+    /// el texto legible mientras sigue vivo.
+    #[test]
+    #[ignore = "requiere un portapapeles real; ejecutar con --ignored"]
+    fn clipboard_roundtrip_keeps_text_while_guard_alive() {
+        let guard = copy_to_clipboard("DIME_ROUNDTRIP").expect("portapapeles disponible");
+        let mut reader = arboard::Clipboard::new().expect("segundo handle del portapapeles");
+        assert_eq!(
+            reader.get_text().expect("leer portapapeles"),
+            "DIME_ROUNDTRIP"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn report_copy_result_failure_writes_warning_to_stderr_writer() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_copy_result::<()>(Err(IABotError::Clipboard("headless".to_string())), &mut buf);
+        let warning = String::from_utf8(buf).expect("utf8");
+        assert!(warning.contains("Aviso"), "aviso: {warning}");
+        assert!(warning.contains("headless"), "aviso: {warning}");
+    }
+
+    // --- command spec: flags del modo comando ---
+
+    #[test]
+    fn cmd_flag_parses_objective() {
+        let args =
+            Args::try_parse_from(["dime", "--cmd", "listar ficheros .log"]).expect("debe parsear");
+        assert_eq!(args.cmd.as_deref(), Some("listar ficheros .log"));
+        assert!(!args.exec);
+        assert!(!args.yes);
+    }
+
+    #[test]
+    fn cmd_defaults_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("debe parsear");
+        assert!(args.cmd.is_none());
+    }
+
+    #[test]
+    fn cmd_conflicts_with_question_flag() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "-q", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_positional_question() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_list_models() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_completions() {
+        let err =
+            Args::try_parse_from(["dime", "--cmd", "ls", "--completions", "bash"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn exec_requires_cmd() {
+        let err = Args::try_parse_from(["dime", "--exec"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn yes_requires_cmd() {
+        let err = Args::try_parse_from(["dime", "--yes"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn exec_and_yes_parse_with_cmd() {
+        let args =
+            Args::try_parse_from(["dime", "--cmd", "ls", "--exec", "--yes"]).expect("debe parsear");
+        assert!(args.exec);
+        assert!(args.yes);
+    }
+
+    // --- command spec: decisión de ejecución ---
+
+    #[test]
+    fn should_execute_covers_all_combinations() {
+        // Tabla literal de los 16 casos (exec, yes, stdin_is_tty, confirmed).
+        let cases: [(bool, bool, bool, bool, bool); 16] = [
+            (false, false, false, false, false),
+            (false, false, false, true, false),
+            (false, false, true, false, false),
+            (false, false, true, true, false),
+            (false, true, false, false, false),
+            (false, true, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (true, false, false, false, false),
+            (true, false, false, true, false),
+            (true, false, true, false, false),
+            (true, false, true, true, true),
+            (true, true, false, false, true),
+            (true, true, false, true, true),
+            (true, true, true, false, true),
+            (true, true, true, true, true),
+        ];
+
+        for (exec, yes, stdin_is_tty, confirmed, expected) in cases {
+            assert_eq!(
+                should_execute(exec, yes, stdin_is_tty, confirmed),
+                expected,
+                "exec={exec} yes={yes} tty={stdin_is_tty} confirmed={confirmed}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_code_uses_128_plus_signal_convention() {
+        // Comando inocuo: el shell se envía TERM a sí mismo y termina por señal.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .expect("lanzar sh");
+        assert!(
+            status.code().is_none(),
+            "el hijo debe terminar por señal: {status:?}"
+        );
+        assert_eq!(exit_code(status), 128 + 15);
+    }
+
+    #[test]
+    fn exit_code_propagates_normal_exit_code() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 3")
+            .status()
+            .expect("lanzar sh");
+        assert_eq!(exit_code(status), 3);
+    }
+
+    #[test]
+    fn should_execute_never_without_exec() {
+        for yes in [false, true] {
+            for stdin_is_tty in [false, true] {
+                for confirmed in [false, true] {
+                    assert!(
+                        !should_execute(false, yes, stdin_is_tty, confirmed),
+                        "sin --exec nunca se ejecuta (yes={yes} tty={stdin_is_tty} confirmed={confirmed})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_execute_requires_confirmation_in_tty_without_yes() {
+        assert!(!should_execute(true, false, true, false));
+        assert!(should_execute(true, false, true, true));
+    }
+
+    #[test]
+    fn should_execute_yes_skips_prompt_but_needs_exec() {
+        assert!(should_execute(true, true, false, false));
+        assert!(!should_execute(false, true, true, true));
+    }
+
+    // --- command spec: interpretación de la confirmación ---
+
+    #[test]
+    fn is_confirmation_accepts_affirmative_answers() {
+        for answer in ["y", "Y", "yes", "YES", "s", "si", "sí", " Si \n"] {
+            assert!(is_confirmation(answer), "debería aceptar: {answer:?}");
+        }
+    }
+
+    #[test]
+    fn is_confirmation_rejects_empty_and_negative_answers() {
+        for answer in ["", " ", "\n", "n", "no", "N", "NO", "nop", "quizá"] {
+            assert!(!is_confirmation(answer), "debería rechazar: {answer:?}");
+        }
     }
 }
