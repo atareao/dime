@@ -47,11 +47,12 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 - Dependencias: `arboard` (clipboard) y `base64`.
 - Limitación conocida: en X11 sin *clipboard manager* el contenido no persiste tras salir el proceso.
 
-### Fase 6 — Modo comando (cambio `command-mode`)
+### Fase 6 — Modo comando (cambio `command-mode`) — ✅ Completada (PR #35 squash → `development`)
 
 `--cmd "<objetivo>"` pide únicamente el comando (sin fences Markdown); `--exec` lo ejecuta **con confirmación**; `--yes` evita el prompt. Seguridad: por defecto solo se imprime; **nunca** se ejecuta sin `--exec`.
-- Spec nueva: `command`.
+- Spec nueva: `command` (5 requisitos).
 - Criterio: `--cmd` devuelve el comando limpio; `--exec` pide confirmación; sin `--exec` no ejecuta nada.
+- Implementado: `clean_command` (fences multilínea/de una línea y backticks envolventes), `should_execute` (tabla de 16 casos), `IABotError::Execution`, ejecución con `sh -c` y propagación del código de salida (`128 + señal` en Unix); 4 tests de integración en `tests/command_mode.rs`.
 - Riesgos: ejecución de shell; requiere una spec explícita de seguridad.
 
 ### Fase 7 — Tests de integración HTTP (cambio `http-mock-tests`)
@@ -61,9 +62,9 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Criterios de aceptación globales
 
-- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–5 cumplen el criterio; pendientes Fases 6–7)*
-- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–5)*
-- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–5)*
+- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–6 cumplen el criterio; pendiente Fase 7)*
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–6)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–6)*
 
 ## Riesgos
 
@@ -72,4 +73,4 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Versionado
 
-**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las **Fases 4 y 5** se han mergeado **sin re-bumpear**: se mantiene `0.4.0`. Las Fases 6–7 en incrementos posteriores.
+**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las **Fases 4, 5 y 6** se han mergeado **sin re-bumpear**: se mantiene `0.4.0`. La **Fase 7** (`http-mock-tests`) se mergea en un incremento posterior; el bump de versión queda para el cierre del plan.
