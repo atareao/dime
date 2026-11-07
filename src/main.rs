@@ -1,8 +1,8 @@
 mod ia;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 use ia::{compose_user_message, ChatResponse, IABot, IABotError};
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::{env, str::FromStr};
 use std::{path::PathBuf, process};
 use tracing::{error, info};
@@ -47,6 +47,49 @@ struct Args {
     /// Garantiza que la salida no contiene secuencias de escape ANSI
     #[arg(long = "no-color")]
     no_color: bool,
+
+    /// Imprime el script de autocompletado del shell indicado y termina
+    ///
+    /// No exige pregunta, no lee `stdin` y no requiere (ni crea) `dime.yml`.
+    #[arg(
+        long = "completions",
+        value_name = "SHELL",
+        value_enum,
+        conflicts_with_all = ["question", "question_flag", "list_models"]
+    )]
+    completions: Option<CompletionShell>,
+}
+
+/// Shell soportado por `--completions`.
+///
+/// Se limita a los tres shells del plan (bash, zsh, fish). El resto de shells de
+/// `clap_complete` (elvish, powershell) no se exponen todavía; un valor fuera de
+/// este conjunto produce un error de uso de `clap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<CompletionShell> for clap_complete::Shell {
+    fn from(shell: CompletionShell) -> Self {
+        match shell {
+            CompletionShell::Bash => clap_complete::Shell::Bash,
+            CompletionShell::Zsh => clap_complete::Shell::Zsh,
+            CompletionShell::Fish => clap_complete::Shell::Fish,
+        }
+    }
+}
+
+/// Escribe en `writer` el script de autocompletado de `dime` para `shell`.
+///
+/// Toda la E/S va al `writer` recibido, de modo que la generación pueda testearse
+/// con un buffer en memoria sin depender del binario ni de `stdout`.
+fn generate_completions(shell: CompletionShell, writer: &mut dyn Write) {
+    let mut command = Args::command();
+    let shell: clap_complete::Shell = shell.into();
+    clap_complete::generate(shell, &mut command, "dime", writer);
 }
 
 /// Estado de la entrada estándar en el momento de resolver la pregunta.
@@ -118,6 +161,16 @@ async fn main() {
     // `--help`/`--version` no deben crear ni leer `dime.yml`, y un error de uso
     // (p. ej. `--temperature` no numérica) termina sin realizar ninguna petición.
     let args = Args::parse();
+
+    // `--completions` no exige pregunta, no lee `stdin` ni toca la configuración:
+    // se atiende antes de resolver/crear `dime.yml` y antes de leer la entrada.
+    if let Some(shell) = args.completions {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        generate_completions(shell, &mut handle);
+        let _ = handle.flush();
+        return;
+    }
 
     let config = match get_config() {
         Some(path) => path,
@@ -606,5 +659,66 @@ mod tests {
     fn temperature_non_numeric_is_usage_error() {
         let err = Args::try_parse_from(["dime", "--temperature", "alta", "hola"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    // --- completions spec: Generación de scripts de completado ---
+
+    #[test]
+    fn completions_flag_parses_each_supported_shell() {
+        for (arg, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+        ] {
+            let args = Args::try_parse_from(["dime", "--completions", arg]).expect("debe parsear");
+            assert_eq!(args.completions, Some(expected));
+        }
+    }
+
+    #[test]
+    fn completions_defaults_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("debe parsear");
+        assert!(args.completions.is_none());
+    }
+
+    #[test]
+    fn completions_rejects_unsupported_shell() {
+        let err = Args::try_parse_from(["dime", "--completions", "elvish"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn completions_conflicts_with_question_flag() {
+        let err =
+            Args::try_parse_from(["dime", "--completions", "bash", "-q", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn completions_conflicts_with_positional_question() {
+        let err = Args::try_parse_from(["dime", "--completions", "bash", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn completions_conflicts_with_list_models() {
+        let err =
+            Args::try_parse_from(["dime", "--completions", "bash", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn generate_completions_writes_script_naming_binary() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            generate_completions(shell, &mut buf);
+            let script = String::from_utf8(buf).expect("script UTF-8");
+            assert!(!script.trim().is_empty(), "script vacío para {shell:?}");
+            assert!(script.contains("dime"), "script sin `dime` para {shell:?}");
+        }
     }
 }
