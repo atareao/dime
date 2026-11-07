@@ -1,1 +1,6 @@
 /target
+
+# Configuración local con secretos (la API key). NO ignorar los *.example.yml
+dime.yml
+.dime.yml
+config.yml
