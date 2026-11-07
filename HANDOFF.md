@@ -2,23 +2,31 @@
 
 ## Estado actual
 
-- Repositorio reconstruido a partir de `origin/main` (`atareao/dime`).
+- Normalización **completada y publicada**.
+- `main` y `development` sincronizadas en `version = 0.2.0`.
+- Tag `v0.2.0` creado y release publicada (binario `dime-linux-x86_64` + `.sha256`).
 - Ramas gitflow: `main` (producción) y `development` (integración).
-- Trabajo completado en la rama `feature/normalizacion-repo`, siguiendo `plans/PLAN-001.md`.
-- Cambio SDD completado: `openspec/changes/normalizacion-repo/` (specs `config` y `chat` implementadas; tareas marcadas al 100%).
-- Refactor de `src/ia.rs` y `src/main.rs`: errores tipados (`thiserror`), sin `unwrap()`/`process::exit` en la capa de configuración, `build_body`/`parse_response`, `temperature` y `num_ctx` por proveedor. 28 tests en verde.
-- CI en `main` y `development` (`rust.yml`: `fmt`, `clippy -D warnings`, `build`, `test`), `release.yml` y `.github/dependabot.yml`.
-- `.gitignore` protegiendo secretos (`dime.yml`, `.dime.yml`, `config.yml`).
+
+## Hecho
+
+- Refactor de `src/ia.rs` y `src/main.rs`: errores tipados con `thiserror`, sin panics, `temperature` operativa, token redactado, 28 tests en verde.
+- Specs OpenSpec `config` y `chat` archivadas.
+- CI (`fmt` / `clippy` / `build` / `test`) en `main` y `development`, más Dependabot.
+- `.gitignore` protegiendo secretos.
 - Documentación: `docs/normalizacion-repo.md`.
+- Plan archivado: `plans/PLAN-001-ARCHIVED.md`.
+- PRs fusionados: #8, #9, #10, #14, #15.
 
 ## Tarea pendiente
 
-- Abrir y fusionar el PR `feature/normalizacion-repo` → `development` (Gitmoji + conventional commits).
+- Ninguna.
 
-## Próximos pasos
+## Follow-ups
 
-1. Confirmar en verde `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` y `cargo test`.
-2. Asegurar CI en verde en `main` y `development`.
-3. Abrir PR `feature/normalizacion-repo` → `development`, revisar y fusionar.
-4. Archivar el cambio con `openspec archive normalizacion-repo` y marcar `plans/PLAN-001.md` como completado si procede.
-5. Follow-ups: migración de `serde_yaml` deprecado, tipado de `temperature`, posible `--list-models`.
+1. Migrar `serde_yaml` (deprecado).
+2. Tipar `temperature` como `f64`.
+3. Valorar `--list-models`.
+
+## Flujo de trabajo
+
+`feature/*` | `chore/*` → PR a `development` → PR `development` → `main` → tag `vX.Y.Z`.
