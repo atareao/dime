@@ -70,6 +70,10 @@ dime -i <INSTRUCCIONES> <PREGUNTA>
 dime --list-models
 dime --json <PREGUNTA>
 dime --no-color <PREGUNTA>
+dime --model <MODELO> <PREGUNTA>
+dime --temperature <NÚMERO> <PREGUNTA>
+dime --provider <openai|ollama> <PREGUNTA>
+dime --system <INSTRUCCIONES> <PREGUNTA>
 ```
 
 ### Entrada por tubería o redirección
@@ -105,11 +109,15 @@ Consideraciones:
 
 | Argumento        | Forma Corta | Descripción                                                                                                                                     |
 | :--------------- | :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--instructions` | `-i`        | Instrucciones de comportamiento para el modelo (rol del sistema). Opcional; si no se indica, se usa `system_role` del archivo de configuración. |
+| `--instructions` | `-i`        | Instrucciones de comportamiento para el modelo (rol del sistema). Opcional; si no se indica, se usa `system_role` del archivo de configuración. Alias: `--system`. |
+| `--system`       |             | Alias de `-i/--instructions` (mismo argumento).                                                                                                  |
 | `--question`     | `-q`        | La pregunta o solicitud que deseas realizar. Opcional si se pasa como argumento posicional o si se lee de `stdin`.                                    |
 | `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta e ignora `stdin`.                                     |
 | `--json`         |             | Emite la respuesta como un único objeto JSON en `stdout` con `content`, `model` y `usage` (o `null`).                                            |
 | `--no-color`     |             | Garantiza que la salida no contiene secuencias de escape ANSI.                                                                                   |
+| `--model`        |             | Sobreescribe `model` de `dime.yml` **sólo para esta invocación**. No reescribe el fichero.                                                        |
+| `--temperature`  |             | Sobreescribe `temperature` de `dime.yml` **sólo para esta invocación**. Debe ser numérica; en caso contrario `clap` da un error de uso.           |
+| `--provider`     |             | Sobreescribe `provider` de `dime.yml` **sólo para esta invocación**. Valores válidos: `openai`, `ollama` (insensible a mayúsculas).               |
 | `QUESTION`       |             | La pregunta o solicitud que deseas realizar como argumento posicional. Usa `-` para forzar la lectura desde `stdin`.                            |
 
 ### Ejemplo
@@ -141,6 +149,35 @@ Cuando el proveedor es `ollama`, `dime` envía `num_ctx` dentro de `options`, po
 ```
 
 Si no defines `num_ctx` en tu `dime.yml`, se usará `32000` por defecto.
+
+### Sobreescribir la configuración para una invocación
+
+Los flags `--model`, `--temperature` y `--provider` ajustan la configuración
+**sólo para la invocación en curso, sin modificar ni reescribir `dime.yml`**. Si
+no se pasa un flag, se usa el valor del fichero (valores efectivos):
+
+```bash
+# Probar otro modelo puntualmente
+dime --model gpt-4o "A que huelen las nubes"
+
+# Bajar la temperatura para una respuesta más determinista
+dime --temperature 0.2 -q "dame solo el comando bash"
+
+# Usar Ollama sin tocar dime.yml (no requiere token)
+dime --provider ollama "A que huelen las nubes"
+```
+
+Notas:
+
+- `--temperature` debe ser numérica; un valor no numérico (`--temperature alta`)
+  produce un error de uso y el proceso termina con código distinto de cero, sin
+  realizar ninguna petición.
+- `--provider` sólo admite `openai` u `ollama` (case-insensitive). Un valor
+  desconocido produce un error legible y termina con código distinto de cero.
+- Con `--provider ollama` el cuerpo de la petición usa `options.num_ctx` y no
+  incluye la cabecera `Authorization`; además no se exige token.
+- Los overrides **no** cambian el rol del sistema: eso sólo lo hacen
+  `-i/--instructions` o su alias `--system`.
 
 ### Listar los modelos disponibles
 

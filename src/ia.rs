@@ -28,6 +28,12 @@ pub enum IABotError {
     /// aporta datos cuando se esperaban.
     #[error("Entrada no válida: {0}")]
     Input(String),
+    /// El proveedor indicado por CLI (`--provider`) no es válido.
+    ///
+    /// Es un error del flag, no del fichero, por eso tiene un mensaje propio y
+    /// no se usa [`IABotError::Config`].
+    #[error("proveedor no soportado: `{0}`; valores válidos: `openai`, `ollama`")]
+    Provider(String),
 }
 
 /// Compone el mensaje de usuario concatenando la pregunta con un contexto
@@ -213,6 +219,44 @@ impl IABot {
                 "el token está vacío para un proveedor que lo requiere".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Aplica los overrides de una sola invocación sobre la configuración
+    /// efectiva (`model`, `temperature` y `provider`).
+    ///
+    /// Sólo muta los campos cuyo override está presente; el resto conserva el
+    /// valor de `dime.yml`. **Nunca** escribe ni modifica el fichero de
+    /// configuración: los overrides viven únicamente en memoria.
+    ///
+    /// Un `provider` distinto de `openai` u `ollama` (comparación insensible a
+    /// mayúsculas) devuelve [`IABotError::Config`] sin alterar la configuración.
+    ///
+    /// Este método se aplica tras `read_content` y **antes** de
+    /// [`IABot::validate`], de modo que un override a `ollama` exime de token.
+    pub fn apply_overrides(
+        &mut self,
+        model: Option<String>,
+        temperature: Option<f64>,
+        provider: Option<String>,
+    ) -> Result<(), IABotError> {
+        if let Some(provider) = &provider {
+            if !provider.eq_ignore_ascii_case("openai") && !provider.eq_ignore_ascii_case("ollama")
+            {
+                return Err(IABotError::Provider(provider.to_string()));
+            }
+        }
+
+        if let Some(model) = model {
+            self.model = model;
+        }
+        if let Some(temperature) = temperature {
+            self.temperature = temperature;
+        }
+        if let Some(provider) = provider {
+            self.provider = provider.to_ascii_lowercase();
+        }
+
         Ok(())
     }
 
@@ -905,6 +949,104 @@ mod tests {
         assert_eq!(cfg.model, "gpt-3.5-turbo");
         assert_eq!(cfg.num_ctx, 32000);
         assert!(cfg.use_https);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- cli-overrides spec: overrides de una sola invocación ---
+
+    #[test]
+    fn apply_overrides_sets_model_temperature_and_provider() {
+        let mut b = openai_bot();
+        b.apply_overrides(
+            Some("gpt-4o".to_string()),
+            Some(0.2),
+            Some("ollama".to_string()),
+        )
+        .expect("overrides válidos");
+        assert_eq!(b.model, "gpt-4o");
+        assert_eq!(b.temperature, 0.2);
+        assert_eq!(b.provider, "ollama");
+    }
+
+    #[test]
+    fn apply_overrides_without_values_keeps_configuration() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, None, None).expect("sin overrides");
+        assert_eq!(b.model, "gpt-3.5-turbo");
+        assert_eq!(b.temperature, 1.0);
+        assert_eq!(b.provider, "openai");
+    }
+
+    #[test]
+    fn apply_overrides_temperature_only_keeps_model_and_provider() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, Some(0.2), None)
+            .expect("override de temperatura");
+        let body = b.build_body("sys", "q").expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["temperature"], serde_json::json!(0.2));
+        assert_eq!(v["model"], "gpt-3.5-turbo");
+    }
+
+    #[test]
+    fn apply_overrides_provider_is_case_insensitive() {
+        let mut b = openai_bot();
+        b.apply_overrides(None, None, Some("OLLAMA".to_string()))
+            .expect("proveedor válido");
+        assert!(b.is_ollama());
+        assert_eq!(b.provider, "ollama");
+    }
+
+    #[test]
+    fn apply_overrides_unknown_provider_is_provider_error_and_keeps_config() {
+        let mut b = openai_bot();
+        let err = b
+            .apply_overrides(None, None, Some("desconocido".to_string()))
+            .expect_err("proveedor inválido");
+        assert!(matches!(err, IABotError::Provider(_)), "err: {err}");
+        assert!(err.to_string().contains("desconocido"), "err: {err}");
+        assert!(
+            !err.to_string().contains("dime.yml"),
+            "el error no debe atribuirse al fichero: {err}"
+        );
+        assert_eq!(b.provider, "openai");
+    }
+
+    #[test]
+    fn apply_overrides_to_ollama_drops_auth_and_does_not_require_token() {
+        let mut b = openai_bot();
+        b.token = String::new();
+        b.apply_overrides(None, Some(0.2), Some("ollama".to_string()))
+            .expect("override a ollama");
+        // El override del proveedor se aplica ANTES de `validate()`: ollama no
+        // exige token.
+        assert!(b.validate().is_ok(), "ollama no debe exigir token");
+        assert_eq!(b.auth_header(), None, "ollama no envía Authorization");
+
+        let body = b.build_body("sys", "hola").expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["options"]["num_ctx"], 32000);
+        assert_eq!(v["options"]["temperature"], serde_json::json!(0.2));
+        assert!(v.get("temperature").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_overrides_does_not_rewrite_config_file() {
+        let path = temp_yaml_path();
+        let original = "model: gpt-3.5-turbo\ntemperature: 1.0\nprovider: openai\n";
+        std::fs::write(&path, original).expect("write temp yaml");
+
+        let mut bot = IABot::read_content(&path).await.expect("read_content");
+        bot.apply_overrides(
+            Some("gpt-4o".to_string()),
+            Some(0.2),
+            Some("ollama".to_string()),
+        )
+        .expect("overrides válidos");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, original, "el fichero no debe reescribirse");
 
         let _ = std::fs::remove_file(&path);
     }

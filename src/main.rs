@@ -12,9 +12,21 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Instructions of ChatGPT behaivur
-    #[arg(short, long)]
+    /// Instructions of ChatGPT behaivur (alias: --system)
+    #[arg(short, long, alias = "system")]
     instructions: Option<String>,
+
+    /// Sobreescribe `model` de `dime.yml` sólo para esta invocación
+    #[arg(long = "model")]
+    model: Option<String>,
+
+    /// Sobreescribe `temperature` de `dime.yml` sólo para esta invocación
+    #[arg(long = "temperature")]
+    temperature: Option<f64>,
+
+    /// Sobreescribe `provider` (`openai`/`ollama`) sólo para esta invocación
+    #[arg(long = "provider")]
+    provider: Option<String>,
 
     /// Question for ChatGPT
     #[arg(short = 'q', long = "question", conflicts_with = "question")]
@@ -102,6 +114,11 @@ fn resolve_input(
 async fn main() {
     info!("main");
 
+    // Se parsean los argumentos antes de tocar el fichero de configuración:
+    // `--help`/`--version` no deben crear ni leer `dime.yml`, y un error de uso
+    // (p. ej. `--temperature` no numérica) termina sin realizar ninguna petición.
+    let args = Args::parse();
+
     let config = match get_config() {
         Some(path) => path,
         None => {
@@ -121,7 +138,7 @@ async fn main() {
         }
     };
 
-    let iabot = match IABot::read_content(&config).await {
+    let mut iabot = match IABot::read_content(&config).await {
         Ok(bot) => bot,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -129,12 +146,17 @@ async fn main() {
         }
     };
 
+    // Los overrides se aplican ANTES de `validate()` (con `--provider ollama`
+    // no se exige token) y sin reescribir `dime.yml`.
+    if let Err(e) = iabot.apply_overrides(args.model, args.temperature, args.provider) {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
+
     if let Err(e) = iabot.validate() {
         eprintln!("Error: {e} (fichero {})", config.display());
         process::exit(1);
     }
-
-    let args = Args::parse();
 
     // El logging nunca debe contaminar `stdout`, reservado para la respuesta
     // (`--json` o el contenido). El color del log se decide por su destino real:
@@ -543,5 +565,46 @@ mod tests {
     fn json_conflicts_with_list_models() {
         let err = Args::try_parse_from(["dime", "--json", "--list-models"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // --- cli-overrides spec: flags de override ---
+
+    #[test]
+    fn override_flags_default_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(args.model.is_none());
+        assert!(args.temperature.is_none());
+        assert!(args.provider.is_none());
+    }
+
+    #[test]
+    fn override_flags_parse() {
+        let args = Args::try_parse_from([
+            "dime",
+            "--model",
+            "gpt-4o",
+            "--temperature",
+            "0.2",
+            "--provider",
+            "ollama",
+            "hola",
+        ])
+        .expect("parse");
+        assert_eq!(args.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(args.temperature, Some(0.2));
+        assert_eq!(args.provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn system_is_alias_of_instructions() {
+        let args = Args::try_parse_from(["dime", "--system", "eres un experto", "-q", "hola"])
+            .expect("parse");
+        assert_eq!(args.instructions.as_deref(), Some("eres un experto"));
+    }
+
+    #[test]
+    fn temperature_non_numeric_is_usage_error() {
+        let err = Args::try_parse_from(["dime", "--temperature", "alta", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }
