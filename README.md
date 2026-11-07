@@ -68,6 +68,8 @@ dime <PREGUNTA>
 dime -i <INSTRUCCIONES> -q <PREGUNTA>
 dime -i <INSTRUCCIONES> <PREGUNTA>
 dime --list-models
+dime --json <PREGUNTA>
+dime --no-color <PREGUNTA>
 ```
 
 ### Entrada por tubería o redirección
@@ -106,6 +108,8 @@ Consideraciones:
 | `--instructions` | `-i`        | Instrucciones de comportamiento para el modelo (rol del sistema). Opcional; si no se indica, se usa `system_role` del archivo de configuración. |
 | `--question`     | `-q`        | La pregunta o solicitud que deseas realizar. Opcional si se pasa como argumento posicional o si se lee de `stdin`.                                    |
 | `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta e ignora `stdin`.                                     |
+| `--json`         |             | Emite la respuesta como un único objeto JSON en `stdout` con `content`, `model` y `usage` (o `null`).                                            |
+| `--no-color`     |             | Garantiza que la salida no contiene secuencias de escape ANSI.                                                                                   |
 | `QUESTION`       |             | La pregunta o solicitud que deseas realizar como argumento posicional. Usa `-` para forzar la lectura desde `stdin`.                            |
 
 ### Ejemplo
@@ -157,6 +161,30 @@ red o de API, se muestra un mensaje legible y el proceso termina con código
 distinto de cero.
 
 Puedes personalizar el endpoint con `models_endpoint` en tu `dime.yml`.
+
+### Salida para scripting
+
+Con `--json`, `dime` escribe en `stdout` **exactamente** un objeto JSON válido
+con las claves `content` (la respuesta), `model` (el modelo usado) y `usage` (el
+objeto de uso del proveedor, o `null` si no se aporta). `model` es siempre una
+cadena: si el proveedor no informa el modelo, se usa el configurado en
+`dime.yml`. No se imprime ningún otro texto en `stdout` (los logs de `tracing`
+van a `stderr`), de modo que puedes encadenarlo con `jq`:
+
+```bash
+dime --json "A que huelen las nubes" | jq -r '.content'
+dime --json -q "resume este error" | jq '.usage.total_tokens'
+```
+
+`--json` no es compatible con `--list-models`.
+
+En modo `--json`, si se produce un error, el mensaje legible se escribe en
+`stderr` y el proceso termina con un código de salida distinto de cero; `stdout`
+queda sin JSON parcial.
+
+Con `--no-color` se garantiza que la salida no contiene secuencias de escape
+ANSI. El color de los logs se aplica automáticamente solo si `stderr` es un TTY:
+al canalizar o redirigir la salida nunca se emiten códigos ANSI.
 
 ## 🛠️ Tecnologías
 

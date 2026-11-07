@@ -1,7 +1,7 @@
 mod ia;
 
 use clap::Parser;
-use ia::{compose_user_message, IABot, IABotError};
+use ia::{compose_user_message, ChatResponse, IABot, IABotError};
 use std::io::{self, IsTerminal, Read};
 use std::{env, str::FromStr};
 use std::{path::PathBuf, process};
@@ -27,6 +27,14 @@ struct Args {
     /// Lista los modelos disponibles del proveedor y termina
     #[arg(long = "list-models", conflicts_with_all = ["question_flag", "question"])]
     list_models: bool,
+
+    /// Emite la respuesta como un único objeto JSON en stdout (content, model, usage)
+    #[arg(long = "json", conflicts_with = "list_models")]
+    json: bool,
+
+    /// Garantiza que la salida no contiene secuencias de escape ANSI
+    #[arg(long = "no-color")]
+    no_color: bool,
 }
 
 /// Estado de la entrada estándar en el momento de resolver la pregunta.
@@ -126,14 +134,22 @@ async fn main() {
         process::exit(1);
     }
 
+    let args = Args::parse();
+
+    // El logging nunca debe contaminar `stdout`, reservado para la respuesta
+    // (`--json` o el contenido). El color del log se decide por su destino real:
+    // sólo ANSI cuando `stderr` es un TTY y no se pasa `--no-color`.
     let filter =
         EnvFilter::from_str(iabot.get_log_level()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = should_colorize(args.no_color, std::io::stderr().is_terminal());
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi),
+        )
         .init();
-
-    let args = Args::parse();
 
     // `--list-models` ignora por completo `stdin`: se resuelve antes de tocarlo.
     if args.list_models {
@@ -194,7 +210,7 @@ async fn main() {
 
     match iabot.ask(system_role, &question).await {
         Ok(response) => {
-            println!("{}", response)
+            println!("{}", render_output(&response, args.json, iabot.get_model()));
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -214,6 +230,37 @@ fn read_stdin() -> Result<String, IABotError> {
         .read_to_string(&mut buffer)
         .map_err(|e| IABotError::Input(format!("no se pudo leer de stdin: {e}")))?;
     Ok(buffer)
+}
+
+/// Compone la salida que se escribe en `stdout`.
+///
+/// Con `json = true` devuelve exactamente un objeto JSON compacto con las claves
+/// `content`, `model` y `usage`. `model` es siempre una cadena: el modelo
+/// informado por el proveedor si está presente y `default_model` en caso
+/// contrario; `usage` es `null` si no se aporta. Con `json = false` devuelve el
+/// contenido tal cual, sin alterarlo. En ningún caso emite secuencias de escape
+/// ANSI.
+fn render_output(response: &ChatResponse, json: bool, default_model: &str) -> String {
+    if json {
+        serde_json::json!({
+            "content": response.content,
+            "model": response.model.as_deref().unwrap_or(default_model),
+            "usage": response.usage,
+        })
+        .to_string()
+    } else {
+        response.content.clone()
+    }
+}
+
+/// Decide si la salida de diagnóstico puede llevar color.
+///
+/// Sólo cuando el destino (`stderr`) es un TTY y no se pasa `--no-color`. Se usa
+/// para configurar `with_ansi` del layer de `tracing`, de modo que nunca se
+/// emiten secuencias de escape ANSI cuando la salida está canalizada o
+/// redirigida.
+fn should_colorize(no_color: bool, stderr_is_terminal: bool) -> bool {
+    !no_color && stderr_is_terminal
 }
 
 /// Construye, en orden, los posibles emplazamientos de `dime.yml` según la
@@ -415,5 +462,86 @@ mod tests {
     #[test]
     fn compose_user_message_ignores_blank_context() {
         assert_eq!(compose_user_message("hola", Some("   \n")), "hola");
+    }
+
+    // --- output spec: Salida JSON ---
+
+    fn chat_response() -> ChatResponse {
+        ChatResponse {
+            content: "Hola".to_string(),
+            model: Some("gpt-4o".to_string()),
+            usage: Some(serde_json::json!({"prompt_tokens": 5})),
+        }
+    }
+
+    #[test]
+    fn render_json_has_content_model_and_usage() {
+        let out = render_output(&chat_response(), true, "gpt-3.5-turbo");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(value["content"], "Hola");
+        assert_eq!(value["model"], "gpt-4o");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+    }
+
+    #[test]
+    fn render_json_without_usage_is_null_and_model_falls_back() {
+        let response = ChatResponse {
+            content: "Hola".to_string(),
+            model: None,
+            usage: None,
+        };
+        let out = render_output(&response, true, "gpt-3.5-turbo");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json valido");
+        assert_eq!(value["model"], "gpt-3.5-turbo");
+        assert!(value["usage"].is_null());
+    }
+
+    #[test]
+    fn render_default_is_plain_content() {
+        assert_eq!(
+            render_output(&chat_response(), false, "gpt-3.5-turbo"),
+            "Hola"
+        );
+    }
+
+    // --- output spec: Control de color ---
+
+    #[test]
+    fn render_never_emits_ansi() {
+        for json in [true, false] {
+            let out = render_output(&chat_response(), json, "gpt-3.5-turbo");
+            assert!(!out.contains('\u{1b}'), "ANSI inesperado: {out:?}");
+        }
+    }
+
+    #[test]
+    fn should_colorize_requires_tty_and_no_no_color() {
+        assert!(!should_colorize(true, true));
+        assert!(!should_colorize(true, false));
+        assert!(!should_colorize(false, false));
+        assert!(should_colorize(false, true));
+    }
+
+    // --- output spec: flags ---
+
+    #[test]
+    fn json_and_no_color_flags_parse() {
+        let args = Args::try_parse_from(["dime", "--json", "--no-color", "hola"]).expect("parse");
+        assert!(args.json);
+        assert!(args.no_color);
+        assert_eq!(args.question.as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn json_and_no_color_default_to_false() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(!args.json);
+        assert!(!args.no_color);
+    }
+
+    #[test]
+    fn json_conflicts_with_list_models() {
+        let err = Args::try_parse_from(["dime", "--json", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
