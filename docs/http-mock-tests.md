@@ -6,7 +6,7 @@ Cobertura de la **ruta real de red** de `dime`: `tests/http_mock.rs` arranca un 
 
 ## Ficheros implicados
 
-- `tests/http_mock.rs` — 11 tests de integración sobre el binario real (`CARGO_BIN_EXE_dime`) con un `MockServer` en un puerto efímero.
+- `tests/http_mock.rs` — 12 tests de integración sobre el binario real (`CARGO_BIN_EXE_dime`) con un `MockServer` en un puerto efímero.
 - `Cargo.toml` — `wiremock = "0.6.5"` únicamente en `[dev-dependencies]` (no en `[dependencies]`).
 - `README.md` — nota de desarrollo sobre la suite de tests.
 - Spec: `openspec/specs/http-testing` (4 requisitos).
@@ -22,6 +22,7 @@ Cobertura de la **ruta real de red** de `dime`: `tests/http_mock.rs` arranca un 
   - **Forma del cuerpo ollama:** `options.num_ctx`, `options.temperature`, ausencia de `temperature` en la raíz y `content` del mensaje `user` como cadena.
   - **`--list-models`:** `GET` al `models_endpoint`, misma autenticación, ids en `stdout` y salida 0; con `401`, error legible y **ningún id** en `stdout`.
   - **Errores:** `401`, `500`, `200` sin `choices` y `200` con cuerpo no JSON → código distinto de cero, `stderr` legible, sin *panic* y con la petición anclada mediante `verify()`/`assert_single_chat_request` (evita que un `404` por defecto haga pasar el test sin ejercitar el escenario).
+  - **`500` con cuerpo de chat válido:** `server_error_with_valid_chat_body_is_not_accepted` (bugfix `http-status-handling`) exige código distinto de cero, `stderr` con `500` y `stdout` sin el contenido, aunque el cuerpo parezca una respuesta correcta.
   - **Validación local:** `provider: openai` con token vacío aborta **antes** de la red (el mock no recibe ninguna petición).
   - **Solo dev-dependency:** un test inspecciona `Cargo.toml` y exige `wiremock` en `[dev-dependencies]` y no en `[dependencies]`.
 - **Helpers:** `assert_readable_error` (exige el prefijo `Error:` y la ausencia de `panicked`, sin acoplarse al texto exacto) y `assert_single_chat_request` (método `POST` y ruta esperada).
@@ -67,7 +68,7 @@ cargo test --test http_mock chat_request_has_method_path_token_and_expected_body
 
 ## Follow-ups
 
-- **`ask()` no inspecciona `response.status()`**: hoy un `500` con un cuerpo de chat válido se trataría como éxito. Los tests actuales usan cuerpos de error coherentes; conviene endurecer `ask()` y añadir el caso «500 con cuerpo válido».
+- **Resuelto en `http-status-handling` (v0.5.1):** `ask()` ya comprueba `response.status()` mediante `check_status`; el caso «`500` con cuerpo válido» está cubierto por `server_error_with_valid_chat_body_is_not_accepted`. Ver `docs/http-status-handling.md`.
 - Valorar un escenario de timeout/red caída (hoy no cubierto).
 - Valorar `--list-models` con respuesta malformada (más allá del `401`).
 - Reutilizar los helpers (`write_config`, `run_dime`, `assert_readable_error`) si se añaden nuevas suites de integración.
