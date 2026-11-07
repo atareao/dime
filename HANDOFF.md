@@ -2,13 +2,15 @@
 
 ## Estado
 
-- `development` en **`0.5.1`** (`210880e`, PR #40 squash) y `main` en **`0.5.0`** (`fc5a819`), pendiente de promoción. **PLAN-003 COMPLETO (Fases 1–7)** mergeado (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash) y promocionado a `main` vía PR #39 (merge commit). Release **`v0.5.0`** publicada (tag + `release.yml` en verde): binario `dime-linux-x86_64` (11.3 MB) y su `.sha256`.
+- `main` y `development` en **`0.5.1`** (`373a4c8`, merge commit del PR #42), sincronizados. Release **`v0.5.1`** publicada (tag + `release.yml` en verde): binario `dime-linux-x86_64` (11.3 MB) y su `.sha256`; contenido: bugfix de estado HTTP (PR #40) + cierre (PR #41). **PLAN-003 COMPLETO (Fases 1–7)** mergeado (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash) y promocionado a `main` vía PR #39 (merge commit); release **`v0.5.0`** publicada.
 - PLAN-003 cerrado y archivado en `plans/PLAN-003-ARCHIVED.md`.
-- Dependabot al día: las ramas obsoletas (`bytes-1.11.1`, `tracing-subscriber-0.3.20`) se borraron; no queda nada pendiente por ese lado. Rama actual de cierre documental: `chore/close-http-status-handling`.
+- Ramas remotas: solo `main` y `development`.
 
 ## Historial reciente
 
 - **Bugfix `http-status-handling`** (v0.5.1, specs `chat` y `models`; PR #40 squash → `development`): `ask()` y `list_models()` comprueban `response.status()` antes de interpretar el cuerpo con el helper puro compartido `check_status(status, body)`. Éxito **solo `2xx`** (`3xx` también es error). Precedencia: si el cuerpo trae `error` del proveedor con mensaje → `IABotError::Api` con el código (`Error devuelto por el proveedor (HTTP 401): invalid_api_key`); si no lo trae, o `error` no aporta mensaje → `IABotError::Status(StatusCode)` (`El proveedor respondió con el estado HTTP 500 Internal Server Error`). Un cuerpo con forma válida ya no se acepta con estado no exitoso. Helpers `api_error(message, Option<StatusCode>)` y `find_provider_error`. Nuevo e2e `server_error_with_valid_chat_body_is_not_accepted` (12 tests en `tests/http_mock.rs`). Bump `0.5.0` → **`0.5.1`** (`vampus upgrade --patch`). Change archivada en `openspec/changes/archive/2026-11-07-http-status-handling`.
+
+- **Release `v0.5.1`**: PR #42 `development` → `main` mergeado (merge commit, `373a4c8`); `main` y `development` sincronizados en `0.5.1`. Contenido: bugfix de estado HTTP (PR #40) + cierre documental (PR #41). Tag `v0.5.1` creado y pusheado; `release.yml` completó con éxito y la release de GitHub **v0.5.1** está publicada con `dime-linux-x86_64` (11.3 MB) y `dime-linux-x86_64.sha256`.
 
 - **PLAN-001** (v0.2.0): normalización del repositorio y saneamiento del CLI — errores tipados con `thiserror`, sin `unwrap()`/`panic!` en producción, `temperature` operativa, token redactado, código muerto retirado, CI (`fmt`/`clippy`/`build`/`test`) en `main` y `development`, Dependabot, `.gitignore` protegiendo secretos. Specs OpenSpec `config` y `chat`.
 - **PLAN-002** (v0.3.0): follow-ups — migración `serde_yaml` → `serde_norway`; `temperature` tipada como `f64` con deserialización tolerante (número o cadena numérica); nuevo comando `--list-models` (nueva spec `models`, soporta OpenAI `v1/models` y Ollama `api/tags`, reintroduce `models_endpoint`).
@@ -37,7 +39,7 @@
 
 ## Siguiente paso
 
-Mergear esta rama documental (`chore/close-http-status-handling` → `development`), promocionar `development` → `main` (PR) y publicar la release **`v0.5.1`** con su tag. Después, atacar los follow-ups técnicos de arriba cuando toque.
+Atacar los follow-ups técnicos de arriba cuando toque: sandboxing de `--exec`, cota de tamaño al leer adjuntos, heurístico de `clean_command` y persistencia del portapapeles en X11 sin *clipboard manager*.
 
 ## Flujo
 
