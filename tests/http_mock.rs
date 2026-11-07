@@ -359,6 +359,44 @@ async fn server_error_response_exits_nonzero_without_panic() {
     assert_single_chat_request(&server).await;
 }
 
+/// Escenario `500 con cuerpo de chat válido`: el estado HTTP manda sobre la
+/// forma del cuerpo. Este caso pasaba como éxito antes de comprobar el código.
+#[tokio::test]
+async fn server_error_with_valid_chat_body_is_not_accepted() {
+    let server = MockServer::start().await;
+    mount_response(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        500,
+        "application/json",
+        CHAT_BODY,
+    )
+    .await;
+
+    let dir = temp_dir("http-500-cuerpo-valido");
+    write_config(dir.path(), &host_port(&server), "openai", TOKEN);
+
+    let output = run_dime(dir.path(), &["-q", "hola"]);
+
+    assert!(
+        !output.status.success(),
+        "un 500 debe terminar con código distinto de cero: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_readable_error(&stderr);
+    assert!(
+        stderr.contains("500"),
+        "stderr debe mencionar el código 500, fue: {stderr:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("respuesta simulada"),
+        "stdout no debe contener el contenido del modelo, fue: {stdout:?}"
+    );
+    assert_single_chat_request(&server).await;
+}
+
 /// Escenario `Cuerpo sin el campo esperado`: 200 con un JSON sin `choices`.
 #[tokio::test]
 async fn body_without_expected_field_exits_nonzero_and_describes_problem() {

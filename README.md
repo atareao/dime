@@ -315,9 +315,13 @@ La consulta se realiza a `{protocolo}://{base_url}/{models_endpoint}` (por ejemp
 para Ollama), incluyendo la cabecera `Authorization: Bearer <token>` cuando el
 proveedor la requiere. El listado funciona tanto con el formato de OpenAI
 (`v1/models`, respuesta `{"data":[{"id": ...}]}`) como con el de Ollama nativo
-(`api/tags`, respuesta `{"models":[{"name": ...}]}`). Si se produce un error de
-red o de API, se muestra un mensaje legible y el proceso termina con código
-distinto de cero.
+(`api/tags`, respuesta `{"models":[{"name": ...}]}`). El código de estado HTTP
+se comprueba antes de interpretar el cuerpo: sólo un `2xx` es éxito, así que
+cualquier otro estado (incluidos `3xx` y `4xx`/`5xx`) se trata como error,
+aunque el cuerpo tenga forma de listado. Si el cuerpo trae el mensaje del
+proveedor se muestra ése junto al código; en su defecto, un mensaje con el
+código y su razón (`500 Internal Server Error`). En ambos casos el proceso
+termina con código distinto de cero.
 
 Puedes personalizar el endpoint con `models_endpoint` en tu `dime.yml`.
 
@@ -391,7 +395,8 @@ puerto efímero, así que **no necesitan red externa** ni credenciales.
   no se compila en el binario publicado. `tests/http_mock.rs` la usa para
   verificar la ruta real de red: método, ruta, cabecera `Authorization` y cuerpo
   de la petición de chat, la petición de `--list-models`, y el comportamiento
-  ante `401`, `500`, cuerpos sin el campo esperado y cuerpos que no son JSON.
+  ante `401`, `500`, `500` con un cuerpo de chat válido (el estado manda sobre
+  la forma del cuerpo), cuerpos sin el campo esperado y cuerpos que no son JSON.
 - Para filtrar sólo esas pruebas: `cargo test --test http_mock`.
 
 Verificación completa antes de abrir un PR:
