@@ -2,25 +2,29 @@
 
 ## Estado
 
-- `main` y `development` en **`0.3.0`**; release **`v0.3.0`** publicada (binario `dime-linux-x86_64` + `.sha256`).
-- Tarea pendiente: **ninguna**.
+- `development` en **`0.3.0`** con las **Fases 2 y 3 de PLAN-003** mergeadas (`stdin-input` PR #26; `scripting-output` PR #27 squash). `main` sigue en `0.3.0`; release **`v0.3.0`** publicada (binario `dime-linux-x86_64` + `.sha256`).
+- Tarea pendiente: **resto de PLAN-003** — Fase 1 `cli-overrides` (necesaria para cerrar `0.4.0`) y Fases 4–7.
 
 ## Historial reciente
 
 - **PLAN-001** (v0.2.0): normalización del repositorio y saneamiento del CLI — errores tipados con `thiserror`, sin `unwrap()`/`panic!` en producción, `temperature` operativa, token redactado, código muerto retirado, CI (`fmt`/`clippy`/`build`/`test`) en `main` y `development`, Dependabot, `.gitignore` protegiendo secretos. Specs OpenSpec `config` y `chat`.
 - **PLAN-002** (v0.3.0): follow-ups — migración `serde_yaml` → `serde_norway`; `temperature` tipada como `f64` con deserialización tolerante (número o cadena numérica); nuevo comando `--list-models` (nueva spec `models`, soporta OpenAI `v1/models` y Ollama `api/tags`, reintroduce `models_endpoint`).
+- **PLAN-003 Fase 2** (`stdin-input`, spec `chat`): entrada por stdin/pipes — pregunta desde stdin o marcador `-`, stdin canalizado como contexto del mensaje de usuario, error tipado `IABotError::Input`, `--list-models` ignora stdin. Lógica pura `resolve_input`/`StdinState`/`ResolvedInput` en `src/main.rs` y `compose_user_message` en `src/ia.rs`.
+- **PLAN-003 Fase 3** (`scripting-output`, nueva spec `output`): `--json` (objeto `{content, model, usage}`, `model` con fallback al configurado, `usage` `null` si falta), `--no-color`, color automático sólo en TTY, logs `tracing` a `stderr`. Tipo `ChatResponse`, `render_output`/`should_colorize`, tests de integración `tests/scripting_output.rs` con mock HTTP.
 
 ## Estado del código
 
-- 49 tests unitarios en `src/ia.rs` y `src/main.rs`.
+- 69 tests unitarios (`src/ia.rs`, `src/main.rs`) + 4 de integración (`tests/scripting_output.rs`).
 - `cargo fmt --check`, `cargo clippy -D warnings` y `cargo test` en verde.
-- Specs vigentes en `openspec/specs/`: `config` (6), `chat` (5), `models` (2).
+- Specs vigentes en `openspec/specs/`: `config` (6), `chat` (6), `models` (2), `output` (2).
 
 ## Follow-ups
 
 - Tipar `temperature` estrictamente como número en la documentación (el formato laxo de cadena sigue aceptado por compatibilidad).
 - Valorar soporte multi-proveedor adicional y `--list-models` con salida formateada.
 - Los warnings de `openspec validate` sobre `SHALL/MUST` son cosméticos (specs en español).
+- Cota de tamaño al leer `stdin` (evitar consumo de memoria sin límite con ficheros/diffs grandes).
+- Usar `Cow<str>` en `render_output` para evitar copias innecesarias al construir la salida.
 
 ## Flujo
 

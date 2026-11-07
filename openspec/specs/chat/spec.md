@@ -53,22 +53,56 @@ El sistema DEBE enviar la temperatura configurada (ya numérica) como número `f
 
 ### Requirement: Tratamiento de respuestas
 
-Ante una respuesta con el formato de chat estándar, el sistema DEBE devolver el contenido del primer elemento de `choices`. Ante una respuesta con campo `error`, DEBE devolver el mensaje de error del proveedor. Ante cualquier otra forma inesperada, DEBE devolver un error tipado, sin *panic*.
+Ante una respuesta con el formato de chat estándar, el sistema DEBE devolver el contenido del primer elemento de choices junto con el modelo (model) y el objeto de uso (usage) de la respuesta cuando estén presentes. Ante una respuesta con campo error, DEBE devolver el mensaje de error del proveedor. Ante cualquier otra forma inesperada, DEBE devolver un error tipado, sin panic.
 
 #### Scenario: Respuesta correcta
 
-- Given una respuesta con `choices[0].message.content = "Hola"`
+- Given una respuesta con choices[0].message.content = "Hola" y model = "gpt-4o"
 - When se procesa
-- Then `ask` devuelve "Hola"
+- Then la consulta devuelve el contenido "Hola" y el modelo "gpt-4o"
 
 #### Scenario: Respuesta de error del proveedor
 
-- Given una respuesta con `error.message = "invalid_api_key"`
+- Given una respuesta con error.message = "invalid_api_key"
 - When se procesa
-- Then `ask` devuelve un error cuyo mensaje es `invalid_api_key`
+- Then la consulta devuelve un error cuyo mensaje es "invalid_api_key"
 
 #### Scenario: Respuesta inesperada
 
-- Given una respuesta JSON sin `choices` ni `error`
+- Given una respuesta JSON sin choices ni error
 - When se procesa
-- Then `ask` devuelve un error tipado y el proceso no entra en *panic`
+- Then la consulta devuelve un error tipado y el proceso no entra en panic
+
+### Requirement: Entrada desde stdin
+
+El sistema DEBE obtener la pregunta desde `stdin` cuando no se aporta `-q`/posicional y `stdin` no es un TTY. El valor `-` como pregunta DEBE forzar la lectura desde `stdin`. Cuando se aporte pregunta y `stdin` no sea un TTY y contenga datos, el contenido de `stdin` DEBE añadirse como contexto al mensaje de usuario. Si `stdin` no es un TTY, no contiene datos y no hay pregunta, el sistema DEBE mostrar un error legible y terminar con código distinto de cero, sin realizar ninguna petición.
+
+#### Scenario: Pregunta sólo desde stdin
+
+- Given que no se aporta `-q`/posicional y `stdin` recibe `hola` por tubería
+- When se ejecuta `dime`
+- Then la pregunta es `hola`
+
+#### Scenario: Marcador `-`
+
+- Given que `stdin` recibe `hola` por tubería
+- When se ejecuta `dime -`
+- Then la pregunta es `hola`
+
+#### Scenario: Pregunta más contexto por stdin
+
+- Given la pregunta `resume` y `stdin` con el contenido de un diff
+- When se ejecuta `dime "resume"" con `stdin` canalizado
+- Then el mensaje de usuario contiene la pregunta y el contexto de `stdin`
+
+#### Scenario: stdin sin datos ni pregunta
+
+- Given que `stdin` no es un TTY, no aporta datos y no hay pregunta
+- When se ejecuta `dime`
+- Then se muestra un error legible y el proceso termina con código distinto de cero
+
+#### Scenario: Uso interactivo sin pregunta
+
+- Given que `stdin` es un TTY y no se aporta pregunta
+- When se ejecuta `dime`
+- Then se muestra el error de uso y el proceso termina con código distinto de cero, sin leer de `stdin`

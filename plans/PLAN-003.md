@@ -21,13 +21,13 @@ Flags que pisan `dime.yml` **solo para esa invocación**, sin modificar el fiche
 - Specs: `config` (los overrides no se persisten), `chat` (usan los valores efectivos).
 - Criterio: con overrides, la petición usa esos valores y el fichero queda intacto.
 
-### Fase 2 — Entrada por stdin/pipes (cambio `stdin-input`)
+### Fase 2 — Entrada por stdin/pipes (cambio `stdin-input`) — ✅ Completada (PR #26 → `development`)
 
 Si no se aporta pregunta y `stdin` no es un TTY, leer de `stdin`; admitir `-` como marcador explícito. Permitir componer `git diff | dime "resume estos cambios"` (instrucción + contexto) y `dime "explica" < file.md`.
 - Specs: `chat`/`config` (resolución de la pregunta y del contexto).
 - Criterio: la entrada por stdin se usa como pregunta o contexto según el caso.
 
-### Fase 3 — Salida para scripting (cambio `scripting-output`)
+### Fase 3 — Salida para scripting (cambio `scripting-output`) — ✅ Completada (PR #27 squash → `development`)
 
 `--json` (respuesta + metadatos: modelo y uso si el proveedor lo aporta) y `--no-color`; color automático solo si la salida es un TTY.
 - Spec nueva: `output`.
@@ -61,8 +61,8 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 ## Criterios de aceptación globales
 
 - [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`.
-- [ ] Sin regresiones en las specs existentes (`config`, `chat`, `models`).
-- [ ] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase.
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 2–3)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 2–3)*
 
 ## Riesgos
 
@@ -71,4 +71,4 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Versionado
 
-`0.4.0` al cerrar las fases 1–3; las fases 4–7 en incrementos posteriores.
+`0.4.0` al cerrar la **Fase 1** (las Fases 2–3 ya están completadas y mergeadas, pero no se ha bumpeado la versión: sigue `0.3.0`); las fases 4–7 en incrementos posteriores. Solo faltan la Fase 1 y las Fases 4–7.
