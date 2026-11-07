@@ -380,3 +380,24 @@ dime --completions fish > ~/.config/fish/completions/dime.fish
 - **serde** y **serde_norway/serde_json:** Para la serialización y deserialización de la configuración y las respuestas de la API.
 - **tracing:** Para la gestión de logs y depuración.
 - **dirs:** Para localizar rutas de configuración y _home_ en distintos sistemas operativos.
+
+## 🧪 Desarrollo y pruebas
+
+La suite se ejecuta con `cargo test`. Además de los tests unitarios, los tests de
+integración lanzan el binario completo contra servidores HTTP locales en un
+puerto efímero, así que **no necesitan red externa** ni credenciales.
+
+- **`wiremock`** es una dependencia **de desarrollo** (sólo `[dev-dependencies]`):
+  no se compila en el binario publicado. `tests/http_mock.rs` la usa para
+  verificar la ruta real de red: método, ruta, cabecera `Authorization` y cuerpo
+  de la petición de chat, la petición de `--list-models`, y el comportamiento
+  ante `401`, `500`, cuerpos sin el campo esperado y cuerpos que no son JSON.
+- Para filtrar sólo esas pruebas: `cargo test --test http_mock`.
+
+Verificación completa antes de abrir un PR:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
