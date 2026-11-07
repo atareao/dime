@@ -20,8 +20,12 @@ struct Args {
     question_flag: Option<String>,
 
     /// Question for ChatGPT
-    #[arg(value_name = "QUESTION", required_unless_present = "question_flag")]
+    #[arg(value_name = "QUESTION", required_unless_present_any = ["question_flag", "list_models"])]
     question: Option<String>,
+
+    /// Lista los modelos disponibles del proveedor y termina
+    #[arg(long = "list-models", conflicts_with_all = ["question_flag", "question"])]
+    list_models: bool,
 }
 
 #[tokio::main]
@@ -68,6 +72,23 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+
+    if args.list_models {
+        match iabot.list_models().await {
+            Ok(models) => {
+                for id in models {
+                    println!("{}", id);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                error!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     let system_role = args
         .instructions
         .as_deref()
@@ -178,5 +199,47 @@ mod tests {
     fn first_existing_returns_none_when_nothing_exists() {
         let c = cands();
         assert_eq!(first_existing(&c, |_| false), None);
+    }
+
+    // --- models spec: Modo listado sin pregunta ---
+
+    #[test]
+    fn list_models_parses_without_question() {
+        let args = Args::try_parse_from(["dime", "--list-models"]).expect("debe parsear");
+        assert!(args.list_models);
+        assert!(args.question.is_none());
+        assert!(args.question_flag.is_none());
+    }
+
+    #[test]
+    fn question_is_required_without_list_models() {
+        let err = Args::try_parse_from(["dime"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn positional_question_parses_in_normal_mode() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("debe parsear");
+        assert!(!args.list_models);
+        assert_eq!(args.question.as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn question_flag_parses_in_normal_mode() {
+        let args = Args::try_parse_from(["dime", "-q", "hola"]).expect("debe parsear");
+        assert_eq!(args.question_flag.as_deref(), Some("hola"));
+        assert!(!args.list_models);
+    }
+
+    #[test]
+    fn list_models_conflicts_with_positional_question() {
+        let err = Args::try_parse_from(["dime", "--list-models", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn list_models_conflicts_with_question_flag() {
+        let err = Args::try_parse_from(["dime", "--list-models", "-q", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

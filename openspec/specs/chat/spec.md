@@ -37,19 +37,19 @@ Con proveedor `ollama`, la petición DEBE incluir `options.num_ctx` con el valor
 
 ### Requirement: Temperatura
 
-El sistema DEBE enviar la temperatura configurada como valor numérico: en el nivel superior para `openai` y dentro de `options` para `ollama`. Si la temperatura no es un número válido, el sistema DEBE fallar con un error legible.
+El sistema DEBE enviar la temperatura configurada (ya numérica) como número `f64`: en el nivel superior del cuerpo para `openai` y dentro de `options` para `ollama`.
 
 #### Scenario: Temperatura válida
 
-- Given `temperature="0.2"`
+- Given `temperature=0.2`
 - When se construye la petición
 - Then la temperatura se envía como el número `0.2`
 
 #### Scenario: Temperatura inválida
 
-- Given `temperature="alta"`
-- When se intenta construir la petición
-- Then se devuelve un error legible en lugar de un *panic`
+- Given un `temperature` con valor no numérico
+- When se carga la configuración
+- Then se produce un error legible antes de construir ninguna petición
 
 ### Requirement: Tratamiento de respuestas
 
