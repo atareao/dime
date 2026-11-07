@@ -1,4 +1,4 @@
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
@@ -19,8 +19,18 @@ pub enum IABotError {
     #[error("Error de red al contactar con el proveedor: {0}")]
     Http(String),
     /// El proveedor devolvió un campo `error`.
-    #[error("Error devuelto por el proveedor: {0}")]
+    ///
+    /// El texto ya es el mensaje final completo: incluye el código de estado
+    /// HTTP cuando se conoce.
+    #[error("{0}")]
     Api(String),
+    /// El proveedor devolvió un código de estado HTTP no exitoso sin un campo
+    /// `error` que explique el motivo.
+    ///
+    /// Portar el [`StatusCode`] permite mostrar la razón canónica (`500 Internal
+    /// Server Error`) sin tabla de códigos propia.
+    #[error("El proveedor respondió con el estado HTTP {0}")]
+    Status(StatusCode),
     /// La respuesta no tiene ni `choices` ni `error`.
     #[error("Respuesta inesperada del proveedor: no contiene `choices` ni `error`")]
     UnexpectedResponse,
@@ -612,12 +622,16 @@ impl IABot {
             IABotError::Http(e.to_string())
         })?;
 
+        // El estado debe leerse antes de consumir el cuerpo con `text()`.
+        let status = response.status();
         let response_body = response
             .text()
             .await
             .map_err(|e| IABotError::Http(e.to_string()))?;
+        debug!("Response status: {}", status);
         debug!("Response length: {}", response_body.len());
 
+        check_status(status, &response_body)?;
         parse_response(&response_body)
     }
 
@@ -643,11 +657,15 @@ impl IABot {
             IABotError::Http(e.to_string())
         })?;
 
+        // El estado debe leerse antes de consumir el cuerpo con `text()`.
+        let status = response.status();
         let response_body = response
             .text()
             .await
             .map_err(|e| IABotError::Http(e.to_string()))?;
+        debug!("Models response status: {}", status);
 
+        check_status(status, &response_body)?;
         parse_models_response(&response_body)
     }
 
@@ -789,27 +807,83 @@ fn parse_models_response(body: &str) -> Result<Vec<String>, IABotError> {
     Err(IABotError::UnexpectedResponse)
 }
 
-/// Extrae el error devuelto por el proveedor, si el cuerpo lo contiene.
+/// Contenido del campo `error` del proveedor cuando está presente.
+enum ProviderError {
+    /// `error` con un mensaje utilizable (objeto con `message` o cadena).
+    Message(String),
+    /// `error` presente pero sin mensaje utilizable (`{}`, un número…).
+    Unnamed,
+}
+
+/// Busca el campo `error` del proveedor en el cuerpo.
 ///
 /// Devuelve `None` cuando no hay campo `error` o éste es `null`.
-fn extract_api_error(body: &str) -> Option<IABotError> {
+fn find_provider_error(body: &str) -> Option<ProviderError> {
     let api_error = serde_json::from_str::<ApiErrorBody>(body).ok()?;
     if api_error.error.is_null() {
         return None;
     }
     if let Some(message) = api_error.error.get("message").and_then(|m| m.as_str()) {
-        return Some(IABotError::Api(message.to_string()));
+        return Some(ProviderError::Message(message.to_string()));
     }
     if let Some(message) = api_error.error.as_str() {
-        return Some(IABotError::Api(message.to_string()));
+        return Some(ProviderError::Message(message.to_string()));
     }
-    Some(IABotError::UnexpectedResponse)
+    Some(ProviderError::Unnamed)
+}
+
+/// Extrae el error devuelto por el proveedor, si el cuerpo lo contiene.
+///
+/// Se usa al interpretar el cuerpo de una respuesta ya aceptada (sin código de
+/// estado a mano). Devuelve `None` cuando no hay campo `error` o éste es `null`.
+fn extract_api_error(body: &str) -> Option<IABotError> {
+    match find_provider_error(body)? {
+        ProviderError::Message(message) => Some(api_error(&message, None)),
+        ProviderError::Unnamed => Some(IABotError::UnexpectedResponse),
+    }
+}
+
+/// Decides the outcome of a response from its HTTP status and body.
+///
+/// Shared criterion for [`IABot::ask`] and [`IABot::list_models`]: only a `2xx`
+/// status is a success and lets the body reach the parser, so a well-formed
+/// payload is accepted. Any other status (including `3xx`) is an error, even
+/// when the body could be parsed as a valid response: the provider message wins
+/// when the body carries an `error` field (keeping the HTTP code in the
+/// message), and [`IABotError::Status`] (which shows the code and its canonical
+/// reason) is used otherwise. Never panics.
+fn check_status(status: StatusCode, body: &str) -> Result<(), IABotError> {
+    if status.is_success() {
+        return Ok(());
+    }
+
+    match find_provider_error(body) {
+        Some(ProviderError::Message(message)) => Err(api_error(&message, Some(status))),
+        _ => Err(IABotError::Status(status)),
+    }
+}
+
+/// Construye un [`IABotError::Api`] con el mensaje final listo para mostrar.
+///
+/// Antepone el código de estado HTTP cuando se conoce, para no perderlo al
+/// informar del error del proveedor.
+fn api_error(message: &str, status: Option<StatusCode>) -> IABotError {
+    match status {
+        Some(code) => IABotError::Api(format!(
+            "Error devuelto por el proveedor (HTTP {}): {}",
+            code.as_u16(),
+            message
+        )),
+        None => IABotError::Api(format!("Error devuelto por el proveedor: {message}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Genera una ruta temporal única para los tests de carga de configuración.
     fn temp_yaml_path() -> PathBuf {
@@ -1624,5 +1698,257 @@ mod tests {
             "rol: {role}"
         );
         assert!(role.contains("comando"), "rol: {role}");
+    }
+
+    // --- http-status-handling spec: el código de estado decide el resultado ---
+
+    /// Construye un `IABot` que apunta al servidor mock local (sin TLS).
+    fn mock_bot(server: &MockServer) -> IABot {
+        IABot {
+            provider: "openai".to_string(),
+            token: "token-de-pruebas".to_string(),
+            base_url: server
+                .uri()
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string(),
+            use_https: false,
+            ..IABot::default()
+        }
+    }
+
+    /// Monta en `server` una respuesta fija con el código, tipo y cuerpo dados.
+    async fn mount_mock(server: &MockServer, verb: &str, route: &str, status: u16, body: &str) {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Cuerpo de chat con forma válida, usado para probar estados de error.
+    const VALID_CHAT_BODY: &str = r#"{"model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":"respuesta simulada"}}]}"#;
+
+    /// Cuerpo de listado con forma válida, usado para probar estados de error.
+    const VALID_MODELS_BODY: &str = r#"{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4o"}]}"#;
+
+    /// Construye un [`StatusCode`] a partir del número, para los tests directos.
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).expect("código HTTP válido")
+    }
+
+    /// Sólo `2xx` es éxito: el cuerpo válido no rescata el estado.
+    #[test]
+    fn check_status_accepts_only_2xx() {
+        assert!(check_status(status(200), VALID_CHAT_BODY).is_ok());
+        assert!(check_status(status(204), "").is_ok());
+        assert!(check_status(status(299), VALID_CHAT_BODY).is_ok());
+    }
+
+    /// Un `3xx` llega al parser si no hay `Location`; debe tratarse como error.
+    #[test]
+    fn check_status_rejects_3xx_with_valid_body() {
+        let err = check_status(status(302), VALID_CHAT_BODY).expect_err("un 302 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 302),
+            "err: {err:?}"
+        );
+        assert!(err.to_string().contains("302"), "err: {err}");
+    }
+
+    /// Un `500` con cuerpo válido es `Status(500)` y menciona la razón.
+    #[test]
+    fn check_status_500_with_valid_body_is_status_error() {
+        let err = check_status(status(500), VALID_CHAT_BODY).expect_err("un 500 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 500),
+            "err: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "El proveedor respondió con el estado HTTP 500 Internal Server Error"
+        );
+    }
+
+    /// Un `429` sin campo `error` es `Status(429)` con su razón canónica.
+    #[test]
+    fn check_status_429_without_error_is_status_error() {
+        let err = check_status(status(429), "{}").expect_err("un 429 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 429),
+            "err: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "El proveedor respondió con el estado HTTP 429 Too Many Requests"
+        );
+    }
+
+    /// El mensaje del proveedor gana, pero sin perder el código HTTP.
+    #[test]
+    fn check_status_401_with_provider_message_is_api_error_with_code() {
+        let err = check_status(status(401), r#"{"error":{"message":"invalid_api_key"}}"#)
+            .expect_err("un 401 nunca es éxito");
+
+        assert!(matches!(err, IABotError::Api(_)), "err: {err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("Error devuelto por el proveedor (HTTP 401): invalid_api_key"),
+            "err: {text}"
+        );
+    }
+
+    /// Precedencia: un `error` sin `message` utilizable cae a `Status(código)`.
+    #[test]
+    fn check_status_error_without_message_falls_back_to_status() {
+        let err = check_status(status(500), r#"{"error":{}}"#).expect_err("un 500 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 500),
+            "err: {err:?}"
+        );
+    }
+
+    /// Un `500` con un cuerpo de chat válido NO puede aceptarse como éxito.
+    #[tokio::test]
+    async fn ask_status_500_with_valid_body_is_an_error() {
+        let server = MockServer::start().await;
+        mount_mock(
+            &server,
+            "POST",
+            "/v1/chat/completions",
+            500,
+            VALID_CHAT_BODY,
+        )
+        .await;
+
+        let err = mock_bot(&server)
+            .ask("sys", "hola", &[])
+            .await
+            .expect_err("un 500 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 500),
+            "err: {err:?}"
+        );
+        assert!(err.to_string().contains("500"), "err: {err}");
+    }
+
+    /// Un `429` sin campo `error` produce un error que menciona el código.
+    #[tokio::test]
+    async fn ask_status_429_without_error_field_is_an_error() {
+        let server = MockServer::start().await;
+        mount_mock(&server, "POST", "/v1/chat/completions", 429, "{}").await;
+
+        let err = mock_bot(&server)
+            .ask("sys", "hola", &[])
+            .await
+            .expect_err("un 429 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 429),
+            "err: {err:?}"
+        );
+        assert!(err.to_string().contains("429"), "err: {err}");
+    }
+
+    /// Un `401` con `error` del proveedor conserva el mensaje del proveedor.
+    #[tokio::test]
+    async fn ask_status_401_with_provider_error_keeps_message() {
+        let server = MockServer::start().await;
+        mount_mock(
+            &server,
+            "POST",
+            "/v1/chat/completions",
+            401,
+            r#"{"error":{"message":"invalid_api_key"}}"#,
+        )
+        .await;
+
+        let err = mock_bot(&server)
+            .ask("sys", "hola", &[])
+            .await
+            .expect_err("un 401 nunca es éxito");
+
+        assert!(matches!(err, IABotError::Api(_)), "err: {err:?}");
+        assert!(err.to_string().contains("invalid_api_key"), "err: {err}");
+    }
+
+    /// Un `200` con cuerpo válido sigue siendo éxito.
+    #[tokio::test]
+    async fn ask_status_200_with_valid_body_succeeds() {
+        let server = MockServer::start().await;
+        mount_mock(
+            &server,
+            "POST",
+            "/v1/chat/completions",
+            200,
+            VALID_CHAT_BODY,
+        )
+        .await;
+
+        let response = mock_bot(&server)
+            .ask("sys", "hola", &[])
+            .await
+            .expect("un 200 válido es éxito");
+
+        assert_eq!(response.content, "respuesta simulada");
+    }
+
+    /// `list_models`: un `500` con `data` válida NO puede aceptarse.
+    #[tokio::test]
+    async fn list_models_status_500_with_valid_body_is_an_error() {
+        let server = MockServer::start().await;
+        mount_mock(&server, "GET", "/v1/models", 500, VALID_MODELS_BODY).await;
+
+        let err = mock_bot(&server)
+            .list_models()
+            .await
+            .expect_err("un 500 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 500),
+            "err: {err:?}"
+        );
+        assert!(err.to_string().contains("500"), "err: {err}");
+    }
+
+    /// `list_models`: un `401` sin `error` produce un error con el código.
+    #[tokio::test]
+    async fn list_models_status_401_without_error_field_is_an_error() {
+        let server = MockServer::start().await;
+        mount_mock(&server, "GET", "/v1/models", 401, "{}").await;
+
+        let err = mock_bot(&server)
+            .list_models()
+            .await
+            .expect_err("un 401 nunca es éxito");
+
+        assert!(
+            matches!(err, IABotError::Status(code) if code.as_u16() == 401),
+            "err: {err:?}"
+        );
+        assert!(err.to_string().contains("401"), "err: {err}");
+    }
+
+    /// `list_models`: un `200` válido devuelve los identificadores.
+    #[tokio::test]
+    async fn list_models_status_200_with_valid_body_returns_ids() {
+        let server = MockServer::start().await;
+        mount_mock(&server, "GET", "/v1/models", 200, VALID_MODELS_BODY).await;
+
+        let ids = mock_bot(&server)
+            .list_models()
+            .await
+            .expect("un 200 válido es éxito");
+
+        assert_eq!(ids, vec!["gpt-4o-mini".to_string(), "gpt-4o".to_string()]);
     }
 }
