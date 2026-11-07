@@ -41,13 +41,18 @@ El archivo de configuración utiliza formato `YAML` e incluye los parámetros ne
 
 | Parámetro     | Valor por Defecto       | Descripción                                                          |
 | :------------ | :---------------------- | :------------------------------------------------------------------- |
-| `log_level`   | `"info"`                | Nivel de registro para la salida de `tracing`.                       |
-| `base_url`    | `"api.openai.com"`      | URL base para la API.                                                |
-| `endpoint`    | `"v1/chat/completions"` | Endpoint para las consultas.                                         |
-| `token`       | `""`                    | **Tu clave API de OpenAI.** (Obligatorio)                            |
-| `model`       | `"gpt-3.5-turbo"`       | El modelo de IA a utilizar.                                          |
-| `temperature` | `"1"`                   | Temperatura de muestreo (controla la creatividad/aleatoriedad).      |
-| `num_ctx`     | `32000`                 | Ventana de contexto enviada en `options.num_ctx` cuando usas Ollama. |
+| `log_level`       | `"info"`                | Nivel de registro para la salida de `tracing`.                       |
+| `base_url`        | `"api.openai.com"`      | URL base para la API.                                                |
+| `endpoint`        | `"v1/chat/completions"` | Endpoint para las consultas.                                         |
+| `models_endpoint` | `"v1/models"`           | Endpoint para listar los modelos disponibles con `--list-models`.    |
+| `token`           | `""`                    | **Tu clave API de OpenAI.** (Obligatorio)                            |
+| `model`           | `"gpt-3.5-turbo"`       | El modelo de IA a utilizar.                                          |
+| `temperature`     | `1.0`                   | Temperatura de muestreo; número o cadena numérica (ej. `0.2`).       |
+| `num_ctx`         | `32000`                 | Ventana de contexto enviada en `options.num_ctx` cuando usas Ollama. |
+
+> **Nota sobre `temperature`:** el formato preferido es un número (`temperature: 0.2`),
+> pero también se acepta una cadena numérica (`temperature: "0.2"`). Un valor no
+> numérico produce un error de configuración legible al cargar `dime.yml`.
 
 > **IMPORTANTE:** Si el campo `token` en la configuración está vacío, el programa terminará con un error.
 
@@ -62,6 +67,7 @@ dime -q <PREGUNTA>
 dime <PREGUNTA>
 dime -i <INSTRUCCIONES> -q <PREGUNTA>
 dime -i <INSTRUCCIONES> <PREGUNTA>
+dime --list-models
 ```
 
 ### Argumentos
@@ -70,6 +76,7 @@ dime -i <INSTRUCCIONES> <PREGUNTA>
 | :--------------- | :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--instructions` | `-i`        | Instrucciones de comportamiento para el modelo (rol del sistema). Opcional; si no se indica, se usa `system_role` del archivo de configuración. |
 | `--question`     | `-q`        | La pregunta o solicitud que deseas realizar. Opcional si se pasa como argumento posicional.                                                     |
+| `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta.                                                    |
 | `QUESTION`       |             | La pregunta o solicitud que deseas realizar como argumento posicional.                                                                          |
 
 ### Ejemplo
@@ -102,6 +109,26 @@ Cuando el proveedor es `ollama`, `dime` envía `num_ctx` dentro de `options`, po
 
 Si no defines `num_ctx` en tu `dime.yml`, se usará `32000` por defecto.
 
+### Listar los modelos disponibles
+
+Con la opción `--list-models` puedes consultar los modelos disponibles y verlos,
+uno por línea, sin hacer ninguna pregunta:
+
+```bash
+dime --list-models
+```
+
+La consulta se realiza a `{protocolo}://{base_url}/{models_endpoint}` (por ejemplo,
+`https://api.openai.com/v1/models` para OpenAI o `http://localhost:11434/api/tags`
+para Ollama), incluyendo la cabecera `Authorization: Bearer <token>` cuando el
+proveedor la requiere. El listado funciona tanto con el formato de OpenAI
+(`v1/models`, respuesta `{"data":[{"id": ...}]}`) como con el de Ollama nativo
+(`api/tags`, respuesta `{"models":[{"name": ...}]}`). Si se produce un error de
+red o de API, se muestra un mensaje legible y el proceso termina con código
+distinto de cero.
+
+Puedes personalizar el endpoint con `models_endpoint` en tu `dime.yml`.
+
 ## 🛠️ Tecnologías
 
 **dime** está construido íntegramente en Rust, aprovechando las siguientes librerías:
@@ -109,6 +136,6 @@ Si no defines `num_ctx` en tu `dime.yml`, se usará `32000` por defecto.
 - **tokio:** Para la ejecución asíncrona.
 - **reqwest:** Para realizar las peticiones HTTP seguras a la API.
 - **clap:** Para el análisis y gestión de los argumentos de línea de comandos.
-- **serde** y **serde_yaml/serde_json:** Para la serialización y deserialización de la configuración y las respuestas de la API.
+- **serde** y **serde_norway/serde_json:** Para la serialización y deserialización de la configuración y las respuestas de la API.
 - **tracing:** Para la gestión de logs y depuración.
 - **dirs:** Para localizar rutas de configuración y _home_ en distintos sistemas operativos.
