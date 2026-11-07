@@ -74,6 +74,7 @@ dime --model <MODELO> <PREGUNTA>
 dime --temperature <NÚMERO> <PREGUNTA>
 dime --provider <openai|ollama> <PREGUNTA>
 dime --system <INSTRUCCIONES> <PREGUNTA>
+dime --completions <bash|zsh|fish>
 ```
 
 ### Entrada por tubería o redirección
@@ -115,6 +116,7 @@ Consideraciones:
 | `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta e ignora `stdin`.                                     |
 | `--json`         |             | Emite la respuesta como un único objeto JSON en `stdout` con `content`, `model` y `usage` (o `null`).                                            |
 | `--no-color`     |             | Garantiza que la salida no contiene secuencias de escape ANSI.                                                                                   |
+| `--completions`  |             | Imprime en `stdout` el script de autocompletado del shell indicado (`bash`, `zsh` o `fish`) y termina. No requiere pregunta, no lee `stdin` ni crea `dime.yml`. Incompatible con la pregunta y con `--list-models`. |
 | `--model`        |             | Sobreescribe `model` de `dime.yml` **sólo para esta invocación**. No reescribe el fichero.                                                        |
 | `--temperature`  |             | Sobreescribe `temperature` de `dime.yml` **sólo para esta invocación**. Debe ser numérica; en caso contrario `clap` da un error de uso.           |
 | `--provider`     |             | Sobreescribe `provider` de `dime.yml` **sólo para esta invocación**. Valores válidos: `openai`, `ollama` (insensible a mayúsculas).               |
@@ -222,6 +224,31 @@ queda sin JSON parcial.
 Con `--no-color` se garantiza que la salida no contiene secuencias de escape
 ANSI. El color de los logs se aplica automáticamente solo si `stderr` es un TTY:
 al canalizar o redirigir la salida nunca se emiten códigos ANSI.
+
+### Autocompletado de shell
+
+Con `--completions` puedes generar el script de autocompletado de **dime** para
+`bash`, `zsh` o `fish`. El script se imprime en `stdout` y el proceso termina con
+código 0; no requiere pregunta, no lee `stdin` y no crea ni necesita `dime.yml`.
+Por ello es ideal para instalarlo en el arranque del shell:
+
+```bash
+# Bash (sesión actual)
+. <(dime --completions bash)
+
+# Bash (instalación permanente, requiere permisos)
+dime --completions bash | sudo tee /etc/bash_completion.d/dime > /dev/null
+
+# Zsh
+dime --completions zsh > ~/.zfunc/_dime
+
+# Fish
+dime --completions fish > ~/.config/fish/completions/dime.fish
+```
+
+`--completions` no es compatible con la pregunta (posicional o `-q`) ni con
+`--list-models`: combinarlos produce un error de uso. Un shell no soportado
+(p. ej. `--completions elvish`) también produce un error de uso.
 
 ## 🛠️ Tecnologías
 
