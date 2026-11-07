@@ -2,7 +2,8 @@ mod ia;
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use ia::{
-    compose_context, compose_user_message, read_files, read_images, ChatResponse, IABot, IABotError,
+    clean_command, compose_context, compose_user_message, read_files, read_images, ChatResponse,
+    IABot, IABotError, COMMAND_SYSTEM_ROLE,
 };
 use std::io::{self, IsTerminal, Read, Write};
 use std::{env, str::FromStr};
@@ -72,6 +73,31 @@ struct Args {
         conflicts_with_all = ["question", "question_flag", "list_models"]
     )]
     completions: Option<CompletionShell>,
+
+    /// Pide al modelo únicamente el comando de shell que cumple el objetivo
+    ///
+    /// Imprime el comando limpio (sin fences de Markdown ni explicaciones) y NO
+    /// lo ejecuta salvo que se pase `--exec`. No usa `stdin` como contexto.
+    #[arg(
+        long = "cmd",
+        value_name = "OBJETIVO",
+        conflicts_with_all = ["question", "question_flag", "list_models", "completions"]
+    )]
+    cmd: Option<String>,
+
+    /// Ejecuta el comando generado tras una confirmación interactiva (requiere `--cmd`)
+    ///
+    /// La confirmación por defecto es NEGATIVA. Si `stdin` no es un TTY y no se
+    /// pasa `--yes`, el comando no se ejecuta y el proceso termina con código
+    /// distinto de cero.
+    #[arg(long = "exec", requires = "cmd")]
+    exec: bool,
+
+    /// Ejecuta el comando sin pedir confirmación (requiere `--cmd`)
+    ///
+    /// Sólo tiene efecto junto con `--exec`: sin `--exec` nunca se ejecuta nada.
+    #[arg(long = "yes", requires = "cmd")]
+    yes: bool,
 }
 
 /// Shell soportado por `--completions`.
@@ -186,6 +212,166 @@ fn compose_user_text(
     }
 }
 
+/// Ejecuta el modo comando (`--cmd`) y devuelve el código de salida de `dime`.
+///
+/// Pide al modelo únicamente el comando, lo imprime limpio y, sólo si procede
+/// (`--exec` y confirmación o `--yes`), lo ejecuta con `sh -c`. **Sin `--exec`
+/// nunca se ejecuta nada.** Un `stdin` que no es TTY sin `--yes` aborta con
+/// código distinto de cero en lugar de ejecutar a ciegas.
+async fn run_command_mode(iabot: &IABot, args: &Args, objective: &str) -> i32 {
+    // En modo comando el rol por defecto pide SÓLO el comando; `--instructions`
+    // sigue pudiendo sobreescribirlo, igual que en el modo pregunta.
+    let system_role = args.instructions.as_deref().unwrap_or(COMMAND_SYSTEM_ROLE);
+
+    let files = match read_files(&args.files).await {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let images = match read_images(&args.images).await {
+        Ok(images) => images,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+
+    let user_text = compose_user_text(objective, None, &files);
+
+    let response = match iabot.ask(system_role, &user_text, &images).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            error!("{}", e);
+            return 1;
+        }
+    };
+
+    let command = clean_command(&response.content);
+    if command.is_empty() {
+        eprintln!("Error: el modelo no devolvió ningún comando");
+        return 1;
+    }
+
+    // El comando SIEMPRE se muestra antes de cualquier posible ejecución.
+    println!("{command}");
+    let _ = io::stdout().flush();
+
+    if !args.exec {
+        return 0;
+    }
+
+    let stdin_is_tty = io::stdin().is_terminal();
+    // Sólo se pregunta cuando hay `--exec`, no hay `--yes` y se puede
+    // interactuar; el resto de casos los decide `should_execute`.
+    let confirmed = if args.exec && !args.yes && stdin_is_tty {
+        match confirm_execution(&command) {
+            Ok(confirmed) => confirmed,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+        }
+    } else {
+        false
+    };
+
+    if !should_execute(args.exec, args.yes, stdin_is_tty, confirmed) {
+        if !args.yes && !stdin_is_tty {
+            eprintln!(
+                "Error: no se puede pedir confirmación porque stdin no es un TTY; usa --yes para ejecutar sin confirmación"
+            );
+            return 1;
+        }
+        eprintln!("Comando no ejecutado.");
+        return 0;
+    }
+
+    match execute_command(&command) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            1
+        }
+    }
+}
+
+/// Decide si hay que ejecutar el comando. Es una función pura.
+///
+/// Reglas de seguridad:
+/// - Sin `exec` (`--exec`) **nunca** se ejecuta.
+/// - Con `yes` (`--yes`) se ejecuta sin confirmación.
+/// - Sin `--yes` se exige un `stdin` interactivo (TTY) y una confirmación
+///   afirmativa explícita.
+fn should_execute(exec: bool, yes: bool, stdin_is_tty: bool, confirmed: bool) -> bool {
+    exec && (yes || (stdin_is_tty && confirmed))
+}
+
+/// Interpreta la respuesta a la confirmación. Por defecto es **negativa**.
+///
+/// Sólo `y`, `yes`, `s`, `si` y `sí` (sin distinguir mayúsculas y admitiendo
+/// espacios) confirman; el vacío y cualquier otra respuesta no ejecutan.
+fn is_confirmation(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes" | "s" | "si" | "sí"
+    )
+}
+
+/// Pide confirmación por `stderr`/`stdin`; por defecto NO ejecuta.
+fn confirm_execution(command: &str) -> Result<bool, IABotError> {
+    {
+        let stderr = io::stderr();
+        let mut handle = stderr.lock();
+        let _ = write!(handle, "¿Ejecutar `{command}`? [y/N] ");
+        let _ = handle.flush();
+    }
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| IABotError::Input(format!("no se pudo leer la confirmación: {e}")))?;
+
+    Ok(is_confirmation(&answer))
+}
+
+/// Ejecuta `command` con `sh -c` (heredando `stdout`/`stderr`).
+///
+/// Devuelve el código de salida del hijo para propagarlo como código de `dime`.
+/// Un fallo al lanzar el shell es [`IABotError::Execution`], nunca un *panic*.
+fn execute_command(command: &str) -> Result<i32, IABotError> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .map_err(|e| IABotError::Execution(e.to_string()))?;
+
+    Ok(exit_code(status))
+}
+
+/// Código de salida a propagar por un proceso terminado.
+///
+/// Si el hijo terminó normalmente se propaga su código. Si terminó por señal se
+/// usa la convención de los shells (`128 + señal`), de modo que un hijo abortado
+/// nunca se confunde con un éxito (`0`).
+fn exit_code(status: process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    1
+}
+
 #[tokio::main]
 async fn main() {
     info!("main");
@@ -193,7 +379,7 @@ async fn main() {
     // Se parsean los argumentos antes de tocar el fichero de configuración:
     // `--help`/`--version` no deben crear ni leer `dime.yml`, y un error de uso
     // (p. ej. `--temperature` no numérica) termina sin realizar ninguna petición.
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // `--completions` no exige pregunta, no lee `stdin` ni toca la configuración:
     // se atiende antes de resolver/crear `dime.yml` y antes de leer la entrada.
@@ -234,7 +420,11 @@ async fn main() {
 
     // Los overrides se aplican ANTES de `validate()` (con `--provider ollama`
     // no se exige token) y sin reescribir `dime.yml`.
-    if let Err(e) = iabot.apply_overrides(args.model, args.temperature, args.provider) {
+    if let Err(e) = iabot.apply_overrides(
+        args.model.take(),
+        args.temperature.take(),
+        args.provider.take(),
+    ) {
         eprintln!("Error: {e}");
         process::exit(1);
     }
@@ -274,6 +464,14 @@ async fn main() {
             }
         }
         return;
+    }
+
+    // `--cmd` es el modo comando: no usa `stdin` como contexto (lo reserva para
+    // la confirmación de `--exec`) y termina con el código de salida del comando
+    // ejecutado, o `0` si sólo se imprime.
+    if let Some(objective) = args.cmd.as_deref() {
+        let code = run_command_mode(&iabot, &args, objective).await;
+        process::exit(code);
     }
 
     let system_role = args
@@ -984,5 +1182,167 @@ mod tests {
         let warning = String::from_utf8(buf).expect("utf8");
         assert!(warning.contains("Aviso"), "aviso: {warning}");
         assert!(warning.contains("headless"), "aviso: {warning}");
+    }
+
+    // --- command spec: flags del modo comando ---
+
+    #[test]
+    fn cmd_flag_parses_objective() {
+        let args =
+            Args::try_parse_from(["dime", "--cmd", "listar ficheros .log"]).expect("debe parsear");
+        assert_eq!(args.cmd.as_deref(), Some("listar ficheros .log"));
+        assert!(!args.exec);
+        assert!(!args.yes);
+    }
+
+    #[test]
+    fn cmd_defaults_to_none() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("debe parsear");
+        assert!(args.cmd.is_none());
+    }
+
+    #[test]
+    fn cmd_conflicts_with_question_flag() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "-q", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_positional_question() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "hola"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_list_models() {
+        let err = Args::try_parse_from(["dime", "--cmd", "ls", "--list-models"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cmd_conflicts_with_completions() {
+        let err =
+            Args::try_parse_from(["dime", "--cmd", "ls", "--completions", "bash"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn exec_requires_cmd() {
+        let err = Args::try_parse_from(["dime", "--exec"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn yes_requires_cmd() {
+        let err = Args::try_parse_from(["dime", "--yes"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn exec_and_yes_parse_with_cmd() {
+        let args =
+            Args::try_parse_from(["dime", "--cmd", "ls", "--exec", "--yes"]).expect("debe parsear");
+        assert!(args.exec);
+        assert!(args.yes);
+    }
+
+    // --- command spec: decisión de ejecución ---
+
+    #[test]
+    fn should_execute_covers_all_combinations() {
+        // Tabla literal de los 16 casos (exec, yes, stdin_is_tty, confirmed).
+        let cases: [(bool, bool, bool, bool, bool); 16] = [
+            (false, false, false, false, false),
+            (false, false, false, true, false),
+            (false, false, true, false, false),
+            (false, false, true, true, false),
+            (false, true, false, false, false),
+            (false, true, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (true, false, false, false, false),
+            (true, false, false, true, false),
+            (true, false, true, false, false),
+            (true, false, true, true, true),
+            (true, true, false, false, true),
+            (true, true, false, true, true),
+            (true, true, true, false, true),
+            (true, true, true, true, true),
+        ];
+
+        for (exec, yes, stdin_is_tty, confirmed, expected) in cases {
+            assert_eq!(
+                should_execute(exec, yes, stdin_is_tty, confirmed),
+                expected,
+                "exec={exec} yes={yes} tty={stdin_is_tty} confirmed={confirmed}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_code_uses_128_plus_signal_convention() {
+        // Comando inocuo: el shell se envía TERM a sí mismo y termina por señal.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .expect("lanzar sh");
+        assert!(
+            status.code().is_none(),
+            "el hijo debe terminar por señal: {status:?}"
+        );
+        assert_eq!(exit_code(status), 128 + 15);
+    }
+
+    #[test]
+    fn exit_code_propagates_normal_exit_code() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 3")
+            .status()
+            .expect("lanzar sh");
+        assert_eq!(exit_code(status), 3);
+    }
+
+    #[test]
+    fn should_execute_never_without_exec() {
+        for yes in [false, true] {
+            for stdin_is_tty in [false, true] {
+                for confirmed in [false, true] {
+                    assert!(
+                        !should_execute(false, yes, stdin_is_tty, confirmed),
+                        "sin --exec nunca se ejecuta (yes={yes} tty={stdin_is_tty} confirmed={confirmed})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_execute_requires_confirmation_in_tty_without_yes() {
+        assert!(!should_execute(true, false, true, false));
+        assert!(should_execute(true, false, true, true));
+    }
+
+    #[test]
+    fn should_execute_yes_skips_prompt_but_needs_exec() {
+        assert!(should_execute(true, true, false, false));
+        assert!(!should_execute(false, true, true, true));
+    }
+
+    // --- command spec: interpretación de la confirmación ---
+
+    #[test]
+    fn is_confirmation_accepts_affirmative_answers() {
+        for answer in ["y", "Y", "yes", "YES", "s", "si", "sí", " Si \n"] {
+            assert!(is_confirmation(answer), "debería aceptar: {answer:?}");
+        }
+    }
+
+    #[test]
+    fn is_confirmation_rejects_empty_and_negative_answers() {
+        for answer in ["", " ", "\n", "n", "no", "N", "NO", "nop", "quizá"] {
+            assert!(!is_confirmation(answer), "debería rechazar: {answer:?}");
+        }
     }
 }

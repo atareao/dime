@@ -14,9 +14,32 @@ Ver `proposal.md` y `plans/PLAN-003.md` (Fase 6). `src/main.rs` resuelve la entr
 
 ### D1. `--cmd` y rol de sistema
 
-`--cmd <objetivo>` se trata como una pregunta con un rol de sistema específico que pide responder sólo con el comando. La respuesta se limpia con una función pura `clean_command(text)` que elimina fences de Markdown (```bash ... ```) y espacios sobrantes.
+`--cmd <objetivo>` se trata como una pregunta con un rol de sistema específico
+que pide responder sólo con el comando. La respuesta se limpia con una función
+pura `clean_command(text)`:
 
-- Alternativa: post-procesar con expresiones regulares complejas. Descartada: basta con recortar fences y `trim`.
+- **Fence multilínea** (```` ``` ```` + lenguaje + salto de línea + comando +
+  ```` ``` ````): se descarta la línea del lenguaje y el fence de cierre; se
+  conservan los saltos de línea internos del comando.
+- **Fence de una línea** (```` ``` ```` + [lenguaje] + comando + ```` ``` ````):
+  se descarta el primer token sólo si es un lenguaje conocido (`bash`, `sh`,
+  `zsh`, `shell`, `console`, `fish`) y el resto no empieza por `-`, `./` ni `/`,
+  para no mutilar `bash -c "echo hi"` ni `sh ./script.sh`. Un fence que sólo
+  contiene el lenguaje devuelve cadena vacía, lo que provoca el error "el modelo
+  no devolvió ningún comando" (evita abrir un shell interactivo con
+  `--exec --yes`).
+- **Backticks inline envolventes**: se quita el par sólo si es un único backtick
+  en cada extremo y no hay ningún otro backtick dentro; así
+  `` `which ls` && `pwd` `` queda intacto (recortarlo corrompería el comando).
+- **Sin fences**: se devuelve el texto recortado tal cual.
+- En todos los casos se aplica `trim` final.
+
+Quitar los backticks envolventes es una medida de **seguridad**: el comando se
+imprime y, con `--exec`, se pasa a `sh -c`, donde los backticks se interpretan
+como sustitución de comando; lo mostrado debe ser exactamente lo ejecutado.
+
+- Alternativa: post-procesar con expresiones regulares complejas. Descartada: la
+  limpieza basada en fences y guardas explícitas es suficiente y testeable.
 
 ### D2. Seguridad por defecto
 
