@@ -55,16 +55,17 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 - Implementado: `clean_command` (fences multilínea/de una línea y backticks envolventes), `should_execute` (tabla de 16 casos), `IABotError::Execution`, ejecución con `sh -c` y propagación del código de salida (`128 + señal` en Unix); 4 tests de integración en `tests/command_mode.rs`.
 - Riesgos: ejecución de shell; requiere una spec explícita de seguridad.
 
-### Fase 7 — Tests de integración HTTP (cambio `http-mock-tests`)
+### Fase 7 — Tests de integración HTTP (cambio `http-mock-tests`) — ✅ Completada (PR #37 squash → `development`)
 
 `wiremock` como dependencia de desarrollo para cubrir `ask` y `list_models` contra un servidor local: cabecera de autorización, cuerpos, respuestas 4xx/5xx y formas inesperadas.
 - Criterio: `cargo test` cubre la ruta real de red (hoy sin test).
+- Implementado: 11 tests en `tests/http_mock.rs` que ejecutan el binario contra un mock con `dime.yml` temporal (`base_url` al mock, `use_https: false`): chat (método, ruta, `Authorization`, cuerpo y respuesta), sin token, forma del cuerpo ollama, `--list-models` (éxito y 401), errores 401/500/cuerpo sin `choices`/no JSON (error legible, sin *panic*, petición anclada con `verify()`) y comprobación de que `wiremock` sólo está en `[dev-dependencies]`. Spec nueva: `http-testing` (4 requisitos). Sin cambios en `src/`.
 
 ## Criterios de aceptación globales
 
-- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–6 cumplen el criterio; pendiente Fase 7)*
-- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–6)*
-- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–6)*
+- [x] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–7 completadas)*
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–7)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–7)*
 
 ## Riesgos
 
@@ -73,4 +74,4 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Versionado
 
-**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las **Fases 4, 5 y 6** se han mergeado **sin re-bumpear**: se mantiene `0.4.0`. La **Fase 7** (`http-mock-tests`) se mergea en un incremento posterior; el bump de versión queda para el cierre del plan.
+**`0.5.0`** al cerrar el plan (Fase 7 incluida). Las Fases 1–3 fijaron `0.4.0`; las Fases 4–6 añadieron features sin re-bumpear, por lo que el cierre aplica un **minor** (`0.4.0` → `0.5.0`, `vampus upgrade --minor`).
