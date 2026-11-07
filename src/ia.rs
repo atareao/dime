@@ -24,9 +24,6 @@ pub enum IABotError {
     /// La respuesta no tiene ni `choices` ni `error`.
     #[error("Respuesta inesperada del proveedor: no contiene `choices` ni `error`")]
     UnexpectedResponse,
-    /// Un campo configurado como cadena no es un número válido.
-    #[error("No se pudo interpretar `{field}` como número (valor: `{value}`)")]
-    NumberParse { field: String, value: String },
 }
 
 /// Cliente de chat para proveedores compatibles con la API de OpenAI.
@@ -45,13 +42,18 @@ pub struct IABot {
     base_url: String,
     #[serde(default = "get_default_endpoint")]
     endpoint: String,
+    #[serde(default = "get_default_models_endpoint")]
+    models_endpoint: String,
     #[serde(default = "get_default_token")]
     token: String,
     #[serde(default = "get_default_model")]
     model: String,
     // What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
-    #[serde(default = "get_default_temperature")]
-    temperature: String,
+    #[serde(
+        default = "get_default_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
+    temperature: f64,
     #[serde(default = "get_default_num_ctx")]
     num_ctx: u32,
     #[serde(default = "get_default_use_https")]
@@ -67,6 +69,7 @@ impl fmt::Debug for IABot {
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("endpoint", &self.endpoint)
+            .field("models_endpoint", &self.models_endpoint)
             .field("token", &token)
             .field("model", &self.model)
             .field("temperature", &self.temperature)
@@ -100,6 +103,10 @@ fn get_default_endpoint() -> String {
     "v1/chat/completions".to_string()
 }
 
+fn get_default_models_endpoint() -> String {
+    "v1/models".to_string()
+}
+
 fn get_default_token() -> String {
     "".to_string()
 }
@@ -108,8 +115,34 @@ fn get_default_model() -> String {
     "gpt-3.5-turbo".to_string()
 }
 
-fn get_default_temperature() -> String {
-    "1".to_string()
+fn get_default_temperature() -> f64 {
+    1.0
+}
+
+/// Deserializa `temperature` aceptando tanto un número YAML (`0.2`) como una
+/// cadena numérica (`"0.2"`).
+///
+/// Un valor no numérico produce un error de deserialización legible, que
+/// [`IABot::read_content`] convierte en [`IABotError::Config`] al cargar.
+fn deserialize_temperature<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_norway::Value::deserialize(deserializer)?;
+
+    match value {
+        serde_norway::Value::Number(number) => number.as_f64().ok_or_else(|| {
+            serde::de::Error::custom("el valor de `temperature` no es un número válido")
+        }),
+        serde_norway::Value::String(text) => text.trim().parse::<f64>().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "el valor de `temperature` no es un número válido: `{text}`"
+            ))
+        }),
+        other => Err(serde::de::Error::custom(format!(
+            "el valor de `temperature` debe ser un número o una cadena numérica, no: {other:?}"
+        ))),
+    }
 }
 
 fn get_default_num_ctx() -> u32 {
@@ -124,6 +157,7 @@ impl Default for IABot {
             provider: get_default_provider(),
             base_url: get_default_base_url(),
             endpoint: get_default_endpoint(),
+            models_endpoint: get_default_models_endpoint(),
             token: get_default_token(),
             model: get_default_model(),
             temperature: get_default_temperature(),
@@ -170,10 +204,20 @@ impl IABot {
         }
     }
 
-    /// Construye la URL de la petición: `{protocolo}://{base_url}/{endpoint}`.
+    /// Construye la URL de la petición de chat: `{protocolo}://{base_url}/{endpoint}`.
     fn build_url(&self) -> String {
+        self.build_url_for(&self.endpoint)
+    }
+
+    /// Construye la URL de listado de modelos: `{protocolo}://{base_url}/{models_endpoint}`.
+    fn build_models_url(&self) -> String {
+        self.build_url_for(&self.models_endpoint)
+    }
+
+    /// Compone `{protocolo}://{base_url}/{path}` respetando `use_https`.
+    fn build_url_for(&self, path: &str) -> String {
         let protocol = if self.use_https { "https" } else { "http" };
-        format!("{}://{}/{}", protocol, self.base_url, self.endpoint)
+        format!("{}://{}/{}", protocol, self.base_url, path)
     }
 
     /// Construye el cuerpo JSON de la petición sin tocar la red.
@@ -181,14 +225,7 @@ impl IABot {
     /// - `openai`: `temperature` en el nivel superior.
     /// - `ollama`: `temperature` y `num_ctx` dentro de `options`.
     fn build_body(&self, system: &str, question: &str) -> Result<String, IABotError> {
-        let temperature: f64 =
-            self.temperature
-                .trim()
-                .parse()
-                .map_err(|_| IABotError::NumberParse {
-                    field: "temperature".to_string(),
-                    value: self.temperature.clone(),
-                })?;
+        let temperature = self.temperature;
 
         let messages = json!([
             {"role": "system", "content": system},
@@ -246,11 +283,41 @@ impl IABot {
         parse_response(&response_body)
     }
 
+    /// Consulta el listado de modelos disponibles del proveedor.
+    ///
+    /// Llama a `{protocolo}://{base_url}/{models_endpoint}` incluyendo la
+    /// cabecera `Authorization` cuando corresponde y devuelve los
+    /// identificadores de los modelos. Ante un error de red o de API devuelve
+    /// un [`IABotError`] tipado, nunca un *panic*.
+    pub async fn list_models(&self) -> Result<Vec<String>, IABotError> {
+        let url = self.build_models_url();
+        debug!("Models url: {}", url);
+
+        let client = Client::new();
+        let mut request_builder = client.get(&url);
+
+        if let Some(header) = self.auth_header() {
+            request_builder = request_builder.header("Authorization", header);
+        }
+
+        let response = request_builder.send().await.map_err(|e| {
+            error!("{}", e);
+            IABotError::Http(e.to_string())
+        })?;
+
+        let response_body = response
+            .text()
+            .await
+            .map_err(|e| IABotError::Http(e.to_string()))?;
+
+        parse_models_response(&response_body)
+    }
+
     /// Escribe en `file` una configuración con los valores por defecto.
     pub async fn write_default(file: &PathBuf) -> Result<(), IABotError> {
         let default = Self::default();
         let content =
-            serde_yaml::to_string(&default).map_err(|e| IABotError::Config(e.to_string()))?;
+            serde_norway::to_string(&default).map_err(|e| IABotError::Config(e.to_string()))?;
         tokio::fs::write(file, content.as_bytes())
             .await
             .map_err(|e| IABotError::Config(e.to_string()))
@@ -265,7 +332,7 @@ impl IABot {
         let content = read_to_string(file)
             .await
             .map_err(|e| IABotError::Config(e.to_string()))?;
-        serde_yaml::from_str(&content).map_err(|e| IABotError::Config(e.to_string()))
+        serde_norway::from_str(&content).map_err(|e| IABotError::Config(e.to_string()))
     }
 }
 
@@ -295,16 +362,8 @@ struct ApiErrorBody {
 /// El campo `error` puede ser un objeto con `message` o una cadena.
 /// Cualquier otra forma devuelve [`IABotError::UnexpectedResponse`], nunca un *panic*.
 fn parse_response(body: &str) -> Result<String, IABotError> {
-    if let Ok(api_error) = serde_json::from_str::<ApiErrorBody>(body) {
-        if api_error.error.is_null() {
-            // `error: null` no es un error real: se continúa al parseo normal.
-        } else if let Some(message) = api_error.error.get("message").and_then(|m| m.as_str()) {
-            return Err(IABotError::Api(message.to_string()));
-        } else if let Some(message) = api_error.error.as_str() {
-            return Err(IABotError::Api(message.to_string()));
-        } else {
-            return Err(IABotError::UnexpectedResponse);
-        }
+    if let Some(err) = extract_api_error(body) {
+        return Err(err);
     }
 
     if let Ok(response) = serde_json::from_str::<ChatResponse>(body) {
@@ -316,9 +375,92 @@ fn parse_response(body: &str) -> Result<String, IABotError> {
     Err(IABotError::UnexpectedResponse)
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelsResponse {
+    models: Vec<OllamaModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelEntry {
+    name: String,
+}
+
+/// Interpreta el cuerpo de la respuesta de listado de modelos.
+///
+/// Primero busca el error del proveedor y después acepta dos formas:
+/// `data[*].id`, usada por OpenAI y proveedores compatibles (`v1/models`), y
+/// `models[*].name`, usada por Ollama nativo (`api/tags`). Cualquier otra forma
+/// devuelve [`IABotError::UnexpectedResponse`], nunca un *panic*.
+fn parse_models_response(body: &str) -> Result<Vec<String>, IABotError> {
+    if let Some(err) = extract_api_error(body) {
+        return Err(err);
+    }
+
+    if let Ok(response) = serde_json::from_str::<ModelsResponse>(body) {
+        return Ok(response.data.into_iter().map(|entry| entry.id).collect());
+    }
+
+    if let Ok(response) = serde_json::from_str::<OllamaModelsResponse>(body) {
+        return Ok(response
+            .models
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect());
+    }
+
+    Err(IABotError::UnexpectedResponse)
+}
+
+/// Extrae el error devuelto por el proveedor, si el cuerpo lo contiene.
+///
+/// Devuelve `None` cuando no hay campo `error` o éste es `null`.
+fn extract_api_error(body: &str) -> Option<IABotError> {
+    let api_error = serde_json::from_str::<ApiErrorBody>(body).ok()?;
+    if api_error.error.is_null() {
+        return None;
+    }
+    if let Some(message) = api_error.error.get("message").and_then(|m| m.as_str()) {
+        return Some(IABotError::Api(message.to_string()));
+    }
+    if let Some(message) = api_error.error.as_str() {
+        return Some(IABotError::Api(message.to_string()));
+    }
+    Some(IABotError::UnexpectedResponse)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Genera una ruta temporal única para los tests de carga de configuración.
+    fn temp_yaml_path() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("dime-test-{}-{}.yml", std::process::id(), n));
+        path
+    }
+
+    /// Carga una configuración desde una cadena YAML usando [`IABot::read_content`],
+    /// exactamente igual que en producción.
+    async fn load_config(yaml: &str) -> Result<IABot, IABotError> {
+        let path = temp_yaml_path();
+        std::fs::write(&path, yaml).expect("write temp yaml");
+        let result = IABot::read_content(&path).await;
+        let _ = std::fs::remove_file(&path);
+        result
+    }
 
     fn bot() -> IABot {
         IABot::default()
@@ -387,20 +529,10 @@ mod tests {
     #[test]
     fn build_body_uses_configured_temperature() {
         let mut b = bot();
-        b.temperature = "0.2".to_string();
+        b.temperature = 0.2;
         let body = b.build_body("sys", "q").expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.2));
-    }
-
-    #[test]
-    fn build_body_invalid_temperature_returns_readable_error() {
-        let mut b = bot();
-        b.temperature = "alta".to_string();
-        let err = b.build_body("sys", "q").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("temperature"), "msg: {msg}");
-        assert!(matches!(err, IABotError::NumberParse { .. }));
     }
 
     // --- chat spec: Tratamiento de respuestas ---
@@ -435,18 +567,151 @@ mod tests {
 
     // --- config spec: Valores por defecto ---
 
-    #[test]
-    fn yaml_partial_uses_defaults() {
-        let cfg: IABot = serde_yaml::from_str("model: mi-modelo").unwrap();
+    #[tokio::test]
+    async fn yaml_partial_uses_defaults() {
+        let cfg = load_config("model: mi-modelo").await.expect("cfg");
         assert_eq!(cfg.model, "mi-modelo");
         assert_eq!(cfg.provider, "openai");
         assert_eq!(cfg.base_url, "api.openai.com");
         assert_eq!(cfg.endpoint, "v1/chat/completions");
-        assert_eq!(cfg.temperature, "1");
+        assert_eq!(cfg.models_endpoint, "v1/models");
+        assert_eq!(cfg.temperature, 1.0);
         assert_eq!(cfg.num_ctx, 32000);
         assert!(cfg.use_https);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.token, "");
+    }
+
+    // --- config spec: temperature numérica tolerante ---
+
+    #[tokio::test]
+    async fn temperature_number_is_parsed() {
+        let cfg = load_config("temperature: 0.2").await.expect("cfg");
+        assert_eq!(cfg.temperature, 0.2);
+    }
+
+    #[tokio::test]
+    async fn temperature_numeric_string_is_parsed() {
+        let cfg = load_config("temperature: \"0.2\"").await.expect("cfg");
+        assert_eq!(cfg.temperature, 0.2);
+    }
+
+    #[tokio::test]
+    async fn temperature_default_is_one() {
+        let cfg = load_config("model: mi-modelo").await.expect("cfg");
+        assert_eq!(cfg.temperature, 1.0);
+    }
+
+    #[tokio::test]
+    async fn temperature_non_numeric_is_config_error() {
+        let err = load_config("temperature: \"alta\"").await.unwrap_err();
+        assert!(matches!(err, IABotError::Config(_)), "err: {err}");
+        assert!(err.to_string().contains("temperature"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn temperature_bool_is_config_error_mentioning_field() {
+        let err = load_config("temperature: true").await.unwrap_err();
+        assert!(matches!(err, IABotError::Config(_)), "err: {err}");
+        assert!(err.to_string().contains("temperature"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn temperature_list_is_config_error_mentioning_field() {
+        let err = load_config("temperature: [1, 2]").await.unwrap_err();
+        assert!(matches!(err, IABotError::Config(_)), "err: {err}");
+        assert!(err.to_string().contains("temperature"), "err: {err}");
+    }
+
+    // --- config spec: Endpoint de modelos configurable ---
+
+    #[tokio::test]
+    async fn models_endpoint_default_is_v1_models() {
+        let cfg = load_config("model: mi-modelo").await.expect("cfg");
+        assert_eq!(cfg.models_endpoint, "v1/models");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_custom_value_is_kept() {
+        let cfg = load_config("models_endpoint: api/tags").await.expect("cfg");
+        assert_eq!(cfg.models_endpoint, "api/tags");
+    }
+
+    // --- models spec: URL de listado ---
+
+    #[test]
+    fn models_url_uses_default_endpoint() {
+        assert_eq!(bot().build_models_url(), "https://api.openai.com/v1/models");
+    }
+
+    #[test]
+    fn models_url_respects_use_https_false() {
+        let mut b = bot();
+        b.use_https = false;
+        b.base_url = "localhost:11434".to_string();
+        b.models_endpoint = "api/tags".to_string();
+        assert_eq!(b.build_models_url(), "http://localhost:11434/api/tags");
+    }
+
+    // --- models spec: Parseo de la respuesta de listado ---
+
+    #[test]
+    fn parse_models_response_returns_ids() {
+        let body = r#"{"data":[{"id":"gpt-3.5-turbo"},{"id":"gpt-4o"}]}"#;
+        assert_eq!(
+            parse_models_response(body).unwrap(),
+            vec!["gpt-3.5-turbo", "gpt-4o"]
+        );
+    }
+
+    #[test]
+    fn parse_models_response_ollama_returns_names() {
+        let body = r#"{"models":[{"name":"llama2"},{"name":"mistral"}]}"#;
+        assert_eq!(
+            parse_models_response(body).unwrap(),
+            vec!["llama2", "mistral"]
+        );
+    }
+
+    #[test]
+    fn parse_models_response_ollama_api_error_returns_api_error() {
+        let body = r#"{"error":{"message":"model not found"}}"#;
+        let err = parse_models_response(body).unwrap_err();
+        assert!(matches!(err, IABotError::Api(_)), "err: {err}");
+    }
+
+    #[test]
+    fn parse_models_response_api_error_returns_api_error() {
+        let body = r#"{"error":{"message":"invalid_api_key"}}"#;
+        let err = parse_models_response(body).unwrap_err();
+        assert!(matches!(err, IABotError::Api(_)), "err: {err}");
+        assert!(err.to_string().contains("invalid_api_key"), "err: {err}");
+    }
+
+    #[test]
+    fn parse_models_response_unexpected_shape_returns_typed_error() {
+        let err = parse_models_response(r#"{"foo":"bar"}"#).unwrap_err();
+        assert!(matches!(err, IABotError::UnexpectedResponse));
+    }
+
+    // --- Bloque A: round-trip YAML con serde_norway ---
+
+    #[test]
+    fn yaml_round_trip_preserves_values() {
+        let b = openai_bot();
+        let yaml = serde_norway::to_string(&b).expect("serialize");
+        let cfg: IABot = serde_norway::from_str(&yaml).expect("deserialize");
+        assert_eq!(cfg.provider, b.provider);
+        assert_eq!(cfg.base_url, b.base_url);
+        assert_eq!(cfg.endpoint, b.endpoint);
+        assert_eq!(cfg.models_endpoint, b.models_endpoint);
+        assert_eq!(cfg.model, b.model);
+        assert_eq!(cfg.temperature, b.temperature);
+        assert_eq!(cfg.num_ctx, b.num_ctx);
+        assert_eq!(cfg.use_https, b.use_https);
+        assert_eq!(cfg.token, b.token);
+        assert_eq!(cfg.log_level, b.log_level);
+        assert_eq!(cfg.system_role, b.system_role);
     }
 
     // --- config spec: Errores legibles ---
