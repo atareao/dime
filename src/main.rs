@@ -11,11 +11,11 @@ use std::{path::PathBuf, process};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Simple program to greet a person
+/// CLI para consultar modelos de IA (OpenAI y Ollama) desde la terminal
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Instructions of ChatGPT behaivur (alias: --system)
+    /// Instrucciones de comportamiento del modelo (alias: --system)
     #[arg(short, long, alias = "system")]
     instructions: Option<String>,
 
