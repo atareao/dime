@@ -46,6 +46,124 @@ pub enum IABotError {
     /// cero, por lo que nunca interrumpe el comando.
     #[error("No se pudo copiar al portapapeles: {0}")]
     Clipboard(String),
+    /// No se pudo ejecutar el comando generado con `--exec`.
+    ///
+    /// Cubre fallos al lanzar el shell (`sh` ausente, permisos, etc.). El código
+    /// de salida del hijo no es un error: se propaga como código de `dime`.
+    #[error("No se pudo ejecutar el comando: {0}")]
+    Execution(String),
+}
+
+/// Rol de sistema del modo comando (`--cmd`).
+///
+/// Pide al modelo **únicamente** el comando que cumple el objetivo: sin
+/// explicaciones, sin comentarios y sin bloques de código ni fences de Markdown,
+/// de modo que la respuesta se pueda imprimir (y ejecutar) tal cual.
+pub const COMMAND_SYSTEM_ROLE: &str = "Responde únicamente con el comando de shell que cumple el objetivo, sin explicaciones, sin comentarios y sin bloques de código ni fences de Markdown. Devuelve una sola línea de comando.";
+
+/// Lenguajes de fence que se descartan cuando el bloque va en una sola línea.
+const FENCE_LANGUAGES: [&str; 6] = ["bash", "sh", "zsh", "shell", "console", "fish"];
+
+/// Limpia la respuesta del modelo para dejar sólo el comando.
+///
+/// Elimina los fences de Markdown (```` ```bash ````, ```` ``` ````), un par de
+/// backticks inline que envuelva todo el comando y los espacios sobrantes. Si la
+/// respuesta contiene un bloque de código precedido de prosa, devuelve el
+/// contenido del primer bloque; si no hay fences, devuelve el texto recortado
+/// tal cual. Es una función pura: no toca red ni sistema de archivos.
+///
+/// Casos límite (todos cubiertos por tests):
+/// - Un fence de una línea sólo descarta el lenguaje si el resto no empieza por
+///   `-`, `./` ni `/`; si sólo contiene el lenguaje, devuelve cadena vacía.
+/// - Los backticks inline sólo se recortan si envuelven todo el texto sin otros
+///   backticks dentro; varias sustituciones quedan intactas.
+///
+/// Quitar los backticks envolventes es una medida de **seguridad**: el comando
+/// se imprime y, con `--exec`, se pasa a `sh -c`, donde `` `...` `` se
+/// interpretaría como sustitución de comando (lo mostrado debe ser exactamente
+/// lo ejecutado).
+pub fn clean_command(text: &str) -> String {
+    let trimmed = text.trim();
+
+    let Some(start) = trimmed.find("```") else {
+        return strip_wrapping_backticks(trimmed);
+    };
+
+    // Todo lo que sigue al fence de apertura.
+    let after_open = &trimmed[start + 3..];
+
+    // La primera línea del bloque puede ser el lenguaje (`bash`, `sh`…): se
+    // descarta. Sin salto de línea, el bloque está en una sola línea y el
+    // lenguaje puede venir seguido del comando.
+    let (body, had_newline) = match after_open.find('\n') {
+        Some(newline) => (&after_open[newline + 1..], true),
+        None => (after_open, false),
+    };
+
+    // Si hay fence de cierre, el comando termina justo antes.
+    let body = match body.find("```") {
+        Some(end) => &body[..end],
+        None => body,
+    };
+
+    let body = if had_newline {
+        body
+    } else {
+        strip_fence_language(body)
+    };
+
+    strip_wrapping_backticks(body.trim())
+}
+
+/// Descarta un token de lenguaje conocido al inicio de un fence de una línea.
+///
+/// `bash touch /tmp/x` → `touch /tmp/x`. Para no mutilar comandos legítimos, el
+/// token **no** se descarta si el resto empieza por `-`, `./` o `/` (p. ej.
+/// `bash -c "echo hi"` o `sh ./script.sh`), y un bloque que sólo contiene el
+/// lenguaje se reduce a cadena vacía (no es un comando ejecutable).
+fn strip_fence_language(body: &str) -> &str {
+    let trimmed = body.trim();
+    if FENCE_LANGUAGES
+        .iter()
+        .any(|language| trimmed.eq_ignore_ascii_case(language))
+    {
+        return "";
+    }
+
+    if let Some((first, rest)) = body.split_once(|c: char| c.is_whitespace()) {
+        if FENCE_LANGUAGES
+            .iter()
+            .any(|language| first.eq_ignore_ascii_case(language))
+        {
+            let rest = rest.trim_start();
+            if !rest.is_empty()
+                && !rest.starts_with('-')
+                && !rest.starts_with("./")
+                && !rest.starts_with('/')
+            {
+                return rest;
+            }
+        }
+    }
+    body
+}
+
+/// Quita un par de backticks inline que envuelva **todo** el texto.
+///
+/// Sólo actúa cuando el primer y el último carácter son un único backtick, no
+/// hay ningún otro backtick dentro (así no se corrompen comandos con varias
+/// sustituciones, p. ej. `` `which ls` && `pwd` ``) y no son triples ni dobles.
+fn strip_wrapping_backticks(text: &str) -> String {
+    if text.len() >= 2
+        && text.starts_with('`')
+        && text.ends_with('`')
+        && !text.starts_with("``")
+        && !text.ends_with("``")
+        && !text[1..text.len() - 1].contains('`')
+    {
+        return text[1..text.len() - 1].trim().to_string();
+    }
+    text.to_string()
 }
 
 /// Compone el mensaje de usuario concatenando la pregunta con un contexto
@@ -1394,5 +1512,117 @@ mod tests {
         assert_eq!(after, original, "el fichero no debe reescribirse");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- command spec: limpieza del comando devuelto por el modelo ---
+
+    #[test]
+    fn clean_command_without_fences_is_trimmed() {
+        assert_eq!(clean_command("  ls -l  "), "ls -l");
+        assert_eq!(clean_command("ls -l"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_bash_fence() {
+        assert_eq!(clean_command("```bash\nls -l\n```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_plain_fence() {
+        assert_eq!(
+            clean_command("```\nfind . -name '*.log'\n```"),
+            "find . -name '*.log'"
+        );
+    }
+
+    #[test]
+    fn clean_command_strips_fence_with_trailing_newline() {
+        assert_eq!(clean_command("```sh\nls -l\n```\n"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_single_line_fence() {
+        assert_eq!(clean_command("```ls -l```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_strips_wrapping_single_backticks() {
+        assert_eq!(clean_command("`touch /tmp/x`"), "touch /tmp/x");
+        assert_eq!(clean_command("  `ls -l`  "), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_keeps_multiple_inline_substitutions_intact() {
+        // Dos sustituciones distintas: recortar el par exterior corrompería el
+        // comando y `sh -c` fallaría con un error de sintaxis.
+        assert_eq!(clean_command("`which ls` && `pwd`"), "`which ls` && `pwd`");
+    }
+
+    #[test]
+    fn clean_command_keeps_legitimate_internal_backticks() {
+        assert_eq!(clean_command("echo `date`"), "echo `date`");
+        assert_eq!(
+            clean_command("mkdir -p `dirname \"/tmp/a b\"`"),
+            "mkdir -p `dirname \"/tmp/a b\"`"
+        );
+        // Doble backtick envolvente no se toca (no es un par simple).
+        assert_eq!(clean_command("``cmd``"), "``cmd``");
+    }
+
+    #[test]
+    fn clean_command_strips_single_line_fence_with_language() {
+        assert_eq!(clean_command("```bash touch /tmp/x```"), "touch /tmp/x");
+        assert_eq!(clean_command("```console exit 3```"), "exit 3");
+        assert_eq!(clean_command("```zsh ls -l```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_keeps_language_word_when_command_starts_with_flag() {
+        // `bash -c "echo hi"` es un comando válido: no debe mutarse a `-c ...`.
+        assert_eq!(
+            clean_command("```bash -c \"echo hi\"```"),
+            "bash -c \"echo hi\""
+        );
+    }
+
+    #[test]
+    fn clean_command_keeps_language_word_when_command_starts_with_path() {
+        assert_eq!(clean_command("```sh ./script.sh```"), "sh ./script.sh");
+    }
+
+    #[test]
+    fn clean_command_language_only_fence_is_empty() {
+        // Un fence que sólo contiene el lenguaje no es un comando: con
+        // `--exec --yes` abriría un shell interactivo.
+        assert_eq!(clean_command("```bash```"), "");
+    }
+
+    #[test]
+    fn clean_command_extracts_first_block_ignoring_prose() {
+        assert_eq!(clean_command("Aquí tienes:\n```bash\nls -l\n```"), "ls -l");
+    }
+
+    #[test]
+    fn clean_command_empty_stays_empty() {
+        assert_eq!(clean_command(""), "");
+        assert_eq!(clean_command("   \n  "), "");
+    }
+
+    #[test]
+    fn clean_command_preserves_inner_newlines_of_a_command() {
+        assert_eq!(
+            clean_command("```bash\nif true; then\n  echo hola\nfi\n```"),
+            "if true; then\n  echo hola\nfi"
+        );
+    }
+
+    #[test]
+    fn command_system_role_asks_only_for_the_command() {
+        let role = COMMAND_SYSTEM_ROLE.to_lowercase();
+        assert!(
+            role.contains("únicamente") || role.contains("unicamente"),
+            "rol: {role}"
+        );
+        assert!(role.contains("comando"), "rol: {role}");
     }
 }

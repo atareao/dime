@@ -78,6 +78,9 @@ dime --file <RUTA> <PREGUNTA>
 dime --image <RUTA> <PREGUNTA>
 dime --copy <PREGUNTA>
 dime --completions <bash|zsh|fish>
+dime --cmd <OBJETIVO>
+dime --cmd <OBJETIVO> --exec
+dime --cmd <OBJETIVO> --exec --yes
 ```
 
 ### Entrada por tubería o redirección
@@ -168,6 +171,55 @@ dime --copy --json "resume este texto" | jq -r '.content'
 > Nota: `arboard` puede emitir por `stderr` un aviso (`Clipboard was dropped
 > very quickly after writing`) en algunos gestores; es inofensivo.
 
+### Modo comando y ejecución segura
+
+Con `--cmd <OBJETIVO>`, **dime** pide al modelo *únicamente* el comando de shell
+que cumple el objetivo (rol de sistema específico, sin explicaciones) e imprime
+el comando limpio: elimina los bloques de código Markdown (```` ```bash ````,
+```` ``` ````) y los espacios sobrantes. En este modo `stdin` **no** se usa como
+contexto, para no chocar con la confirmación de `--exec`.
+
+```bash
+# Sólo imprime el comando: NUNCA lo ejecuta
+dime --cmd "listar los ficheros .log modificados hoy"
+
+# Lo imprime y pide confirmación interactiva antes de ejecutarlo
+dime --cmd "listar los ficheros .log modificados hoy" --exec
+
+# Lo imprime y lo ejecuta sin preguntar (sin TTY, para scripts)
+dime --cmd "listar los ficheros .log modificados hoy" --exec --yes
+```
+
+> ⚠️ **Seguridad:** ejecutar comandos generados por un modelo es peligroso.
+> `dime` aplica estas garantías:
+>
+> - **Sin `--exec` no se ejecuta nada**: sólo se imprime el comando.
+> - El comando **siempre se muestra** antes de cualquier ejecución.
+> - La confirmación interactiva tiene **respuesta por defecto negativa**:
+>   vacío, `n` o `no` no ejecutan (sólo `y`/`yes`/`s`/`si`/`sí` confirman).
+> - Si `stdin` **no es un TTY** y no se pasa `--yes`, `dime` se niega a ejecutar
+>   y termina con código distinto de cero.
+> - `--exec` y `--yes` **requieren** `--cmd`; `--cmd` es incompatible con la
+>   pregunta (`-q`/posicional), `--list-models` y `--completions`.
+> - **Prompt injection:** combinar `--file`/`--image` con `--exec --yes` permite
+>   que el contenido adjunto incluya instrucciones que el modelo traduzca en un
+>   comando: `dime` ejecutará ese comando **sin preguntar**. No uses
+>   `--exec --yes` con contenido no confiable (diffs, páginas web, documentos de
+>   terceros); revisa siempre el comando impreso.
+> - No hay *sandboxing*: el comando se ejecuta con `sh -c` con tus permisos. El
+>   usuario es responsable de lo que ejecuta.
+
+En modo `--cmd` la salida es siempre el comando limpio (se conservan los saltos
+de línea internos de los comandos multilínea); `--json` no se aplica.
+
+Con `--exec`, el comando se ejecuta con `sh -c` heredando `stdout`/`stderr`, y su
+código de salida se propaga como código de salida de `dime`:
+
+```bash
+dime --cmd "comprueba si existe /etc/hosts" --exec --yes
+echo $?   # código de salida del comando ejecutado
+```
+
 ### Argumentos
 
 | Argumento        | Forma Corta | Descripción                                                                                                                                     |
@@ -182,6 +234,9 @@ dime --copy --json "resume este texto" | jq -r '.content'
 | `--image`        |             | Adjunta una imagen multimodal (repetible). Formatos: `png`, `jpg`/`jpeg`, `gif`, `webp`. Con `openai` se envían como *content parts* (`data:<mime>;base64,...`); con `ollama` en el campo `images`. Una imagen ilegible o con extensión no soportada produce un error legible y código distinto de cero. |
 | `--copy`         |             | Copia la respuesta al portapapeles además de imprimirla. Es *best-effort*: si el portapapeles no está disponible (p. ej. entorno *headless*), se advierte por `stderr` y el proceso termina con código `0`. En modo `--json` se copia el campo `content`. |
 | `--completions`  |             | Imprime en `stdout` el script de autocompletado del shell indicado (`bash`, `zsh` o `fish`) y termina. No requiere pregunta, no lee `stdin` ni crea `dime.yml`. Incompatible con la pregunta y con `--list-models`. |
+| `--cmd`          |             | Pide al modelo **únicamente** el comando que cumple el objetivo e imprime el comando limpio (sin fences de Markdown). **Nunca lo ejecuta** salvo con `--exec`. No usa `stdin` como contexto. Incompatible con la pregunta, `--list-models` y `--completions`. |
+| `--exec`         |             | Ejecuta el comando de `--cmd` con `sh -c` tras una confirmación interactiva (por defecto **negativa**) y propaga su código de salida. Requiere `--cmd`. Sin `--exec` no se ejecuta nada. En un `stdin` que no es TTY exige `--yes`. |
+| `--yes`          |             | Con `--exec`, ejecuta sin pedir confirmación. Requiere `--cmd`. Sin `--exec` no ejecuta nada. |
 | `--model`        |             | Sobreescribe `model` de `dime.yml` **sólo para esta invocación**. No reescribe el fichero.                                                        |
 | `--temperature`  |             | Sobreescribe `temperature` de `dime.yml` **sólo para esta invocación**. Debe ser numérica; en caso contrario `clap` da un error de uso.           |
 | `--provider`     |             | Sobreescribe `provider` de `dime.yml` **sólo para esta invocación**. Valores válidos: `openai`, `ollama` (insensible a mayúsculas).               |
