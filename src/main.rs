@@ -1,7 +1,8 @@
 mod ia;
 
 use clap::Parser;
-use ia::IABot;
+use ia::{compose_user_message, IABot, IABotError};
+use std::io::{self, IsTerminal, Read};
 use std::{env, str::FromStr};
 use std::{path::PathBuf, process};
 use tracing::{error, info};
@@ -20,12 +21,73 @@ struct Args {
     question_flag: Option<String>,
 
     /// Question for ChatGPT
-    #[arg(value_name = "QUESTION", required_unless_present_any = ["question_flag", "list_models"])]
+    #[arg(value_name = "QUESTION")]
     question: Option<String>,
 
     /// Lista los modelos disponibles del proveedor y termina
     #[arg(long = "list-models", conflicts_with_all = ["question_flag", "question"])]
     list_models: bool,
+}
+
+/// Estado de la entrada estándar en el momento de resolver la pregunta.
+///
+/// Se modela explícitamente para no leer nunca de un `stdin` interactivo y
+/// para poder decidir la fuente de la pregunta con una función pura y testeable.
+#[derive(Debug, PartialEq, Eq)]
+enum StdinState<'a> {
+    /// `stdin` es un TTY (uso interactivo): nunca se lee.
+    Tty,
+    /// `stdin` no es un TTY y no aporta datos (EOF inmediato).
+    Empty,
+    /// `stdin` no es un TTY y aporta estos datos.
+    Data(&'a str),
+}
+
+/// Resultado de resolver la entrada del usuario a partir de los argumentos y de
+/// `stdin`.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedInput {
+    /// Pregunta simple, sin contexto adicional.
+    Question(String),
+    /// Pregunta más contexto leído de `stdin`.
+    QuestionWithContext { question: String, context: String },
+}
+
+/// Decide la fuente de la pregunta y del contexto a partir de la pregunta
+/// aportada por argumentos y del estado de `stdin`.
+///
+/// Es una función pura: no toca `stdin` ni el sistema de archivos.
+fn resolve_input(
+    question_arg: Option<&str>,
+    stdin: StdinState<'_>,
+) -> Result<ResolvedInput, IABotError> {
+    match stdin {
+        // Uso interactivo: nunca se lee de stdin. Sólo vale una pregunta real
+        // (el marcador `-` implicaría leer de un terminal interactivo).
+        StdinState::Tty => match question_arg {
+            Some(question) if question != "-" => Ok(ResolvedInput::Question(question.to_string())),
+            _ => Err(IABotError::Input(
+                "no se ha proporcionado ninguna pregunta; usa -q/posicional o canaliza la entrada por stdin"
+                    .to_string(),
+            )),
+        },
+        // Sin datos y sin pregunta no hay nada que enviar.
+        StdinState::Empty => match question_arg {
+            Some(question) if question != "-" => Ok(ResolvedInput::Question(question.to_string())),
+            _ => Err(IABotError::Input(
+                "stdin está vacío y no se ha proporcionado ninguna pregunta".to_string(),
+            )),
+        },
+        // Con datos: la pregunta sale de stdin (sin argumento o con `-`) o bien
+        // se usa el argumento como pregunta y stdin como contexto.
+        StdinState::Data(data) => match question_arg {
+            Some("-") | None => Ok(ResolvedInput::Question(data.trim().to_string())),
+            Some(question) => Ok(ResolvedInput::QuestionWithContext {
+                question: question.to_string(),
+                context: data.trim_end().to_string(),
+            }),
+        },
+    }
 }
 
 #[tokio::main]
@@ -73,6 +135,7 @@ async fn main() {
 
     let args = Args::parse();
 
+    // `--list-models` ignora por completo `stdin`: se resuelve antes de tocarlo.
     if args.list_models {
         match iabot.list_models().await {
             Ok(models) => {
@@ -93,12 +156,43 @@ async fn main() {
         .instructions
         .as_deref()
         .unwrap_or_else(|| iabot.get_system_role());
-    let Some(question) = args.question_flag.as_deref().or(args.question.as_deref()) else {
-        eprintln!("Error: no se ha proporcionado ninguna pregunta");
-        process::exit(1);
+
+    // Sólo se lee `stdin` cuando NO es un TTY; en modo interactivo nunca se
+    // bloquea la ejecución esperando datos.
+    let stdin_data = if io::stdin().is_terminal() {
+        None
+    } else {
+        match read_stdin() {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+    };
+    let stdin_state = match stdin_data.as_deref() {
+        None => StdinState::Tty,
+        Some(data) if data.trim().is_empty() => StdinState::Empty,
+        Some(data) => StdinState::Data(data),
     };
 
-    match iabot.ask(system_role, question).await {
+    let question_arg = args.question_flag.as_deref().or(args.question.as_deref());
+    let resolved = match resolve_input(question_arg, stdin_state) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let question = match resolved {
+        ResolvedInput::Question(question) => question,
+        ResolvedInput::QuestionWithContext { question, context } => {
+            compose_user_message(&question, Some(&context))
+        }
+    };
+
+    match iabot.ask(system_role, &question).await {
         Ok(response) => {
             println!("{}", response)
         }
@@ -108,6 +202,18 @@ async fn main() {
             process::exit(1);
         }
     }
+}
+
+/// Lee todo `stdin` como texto UTF-8.
+///
+/// Capa fina sobre la entrada estándar; las decisiones sobre qué hacer con los
+/// datos viven en [`resolve_input`], que es pura y testeable.
+fn read_stdin() -> Result<String, IABotError> {
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|e| IABotError::Input(format!("no se pudo leer de stdin: {e}")))?;
+    Ok(buffer)
 }
 
 /// Construye, en orden, los posibles emplazamientos de `dime.yml` según la
@@ -212,9 +318,11 @@ mod tests {
     }
 
     #[test]
-    fn question_is_required_without_list_models() {
-        let err = Args::try_parse_from(["dime"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn question_is_optional_in_clap() {
+        let args = Args::try_parse_from(["dime"]).expect("debe parsear sin pregunta");
+        assert!(!args.list_models);
+        assert!(args.question.is_none());
+        assert!(args.question_flag.is_none());
     }
 
     #[test]
@@ -241,5 +349,71 @@ mod tests {
     fn list_models_conflicts_with_question_flag() {
         let err = Args::try_parse_from(["dime", "--list-models", "-q", "hola"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // --- stdin-input spec: Entrada desde stdin ---
+
+    #[test]
+    fn scenario_question_only_from_stdin() {
+        let resolved = resolve_input(None, StdinState::Data("hola\n")).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn scenario_dash_marker_forces_stdin() {
+        let resolved = resolve_input(Some("-"), StdinState::Data("hola\n")).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn scenario_question_plus_context_from_stdin() {
+        let resolved = resolve_input(Some("resume"), StdinState::Data("diff --git a b\n"))
+            .expect("debe resolver");
+        let ResolvedInput::QuestionWithContext { question, context } = resolved else {
+            panic!("esperado QuestionWithContext");
+        };
+        let message = compose_user_message(&question, Some(&context));
+        assert!(message.contains("resume"), "mensaje: {message}");
+        assert!(message.contains("diff --git a b"), "mensaje: {message}");
+    }
+
+    #[test]
+    fn scenario_stdin_without_data_or_question_errors() {
+        let err = resolve_input(None, StdinState::Empty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn scenario_tty_without_question_is_usage_error() {
+        let err = resolve_input(None, StdinState::Tty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn tty_with_question_does_not_use_stdin() {
+        let resolved = resolve_input(Some("hola"), StdinState::Tty).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn empty_stdin_with_question_is_plain_question() {
+        let resolved = resolve_input(Some("hola"), StdinState::Empty).expect("debe resolver");
+        assert_eq!(resolved, ResolvedInput::Question("hola".to_string()));
+    }
+
+    #[test]
+    fn dash_marker_with_empty_stdin_errors() {
+        let err = resolve_input(Some("-"), StdinState::Empty).expect_err("debe fallar");
+        assert!(matches!(err, IABotError::Input(_)), "err: {err}");
+    }
+
+    #[test]
+    fn compose_user_message_without_context_is_question() {
+        assert_eq!(compose_user_message("hola", None), "hola");
+    }
+
+    #[test]
+    fn compose_user_message_ignores_blank_context() {
+        assert_eq!(compose_user_message("hola", Some("   \n")), "hola");
     }
 }

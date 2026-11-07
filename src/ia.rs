@@ -24,6 +24,23 @@ pub enum IABotError {
     /// La respuesta no tiene ni `choices` ni `error`.
     #[error("Respuesta inesperada del proveedor: no contiene `choices` ni `error`")]
     UnexpectedResponse,
+    /// La entrada del usuario no es utilizable: falta la pregunta o `stdin` no
+    /// aporta datos cuando se esperaban.
+    #[error("Entrada no válida: {0}")]
+    Input(String),
+}
+
+/// Compone el mensaje de usuario concatenando la pregunta con un contexto
+/// opcional (por ejemplo, el contenido leído de `stdin`).
+///
+/// Si `context` es `None` o sólo contiene espacios en blanco, devuelve la
+/// pregunta tal cual. En caso contrario, usa la pregunta seguida de una línea
+/// en blanco y el contexto recortado por la derecha.
+pub fn compose_user_message(question: &str, context: Option<&str>) -> String {
+    match context.map(str::trim_end) {
+        Some(context) if !context.is_empty() => format!("{question}\n\n{context}"),
+        _ => question.to_string(),
+    }
 }
 
 /// Cliente de chat para proveedores compatibles con la API de OpenAI.
