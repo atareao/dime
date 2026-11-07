@@ -33,7 +33,7 @@ Si no se aporta pregunta y `stdin` no es un TTY, leer de `stdin`; admitir `-` co
 - Spec nueva: `output`.
 - Criterio: `--json` emite JSON válido; `--no-color` no emite códigos ANSI.
 
-### Fase 4 — Shell completions (cambio `shell-completions`)
+### Fase 4 — Shell completions (cambio `shell-completions`) — ✅ Completada (PR #31 squash → `development`)
 
 Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de completado.
 - Spec nueva: `completions`.
@@ -60,9 +60,9 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Criterios de aceptación globales
 
-- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–3 cumplen el criterio; pendientes Fases 4–7)*
-- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–3)*
-- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–3)*
+- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–4 cumplen el criterio; pendientes Fases 5–7)*
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–4)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–4)*
 
 ## Riesgos
 
@@ -71,4 +71,4 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Versionado
 
-**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las Fases 4–7 en incrementos posteriores.
+**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). La **Fase 4** se ha mergeado **sin re-bumpear**: se mantiene `0.4.0`. Las Fases 5–7 en incrementos posteriores.
