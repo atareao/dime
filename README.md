@@ -74,6 +74,9 @@ dime --model <MODELO> <PREGUNTA>
 dime --temperature <NÚMERO> <PREGUNTA>
 dime --provider <openai|ollama> <PREGUNTA>
 dime --system <INSTRUCCIONES> <PREGUNTA>
+dime --file <RUTA> <PREGUNTA>
+dime --image <RUTA> <PREGUNTA>
+dime --copy <PREGUNTA>
 dime --completions <bash|zsh|fish>
 ```
 
@@ -106,6 +109,65 @@ Consideraciones:
   se muestra un error legible y el proceso termina con código distinto de cero.
 - `--list-models` **ignora** `stdin`: nunca se bloquea esperando datos.
 
+### Adjuntar contexto e imágenes
+
+`--file <RUTA>` (repetible) añade el contenido de uno o más ficheros como
+contexto del mensaje de usuario, **después** del contexto de `stdin` y
+respetando el orden indicado. Cada fichero se precede de una cabecera con su
+ruta:
+
+```bash
+# Un fichero como contexto
+dime --file README.md "resume este fichero"
+
+# Varios ficheros, en orden
+dime --file src/main.rs --file Cargo.toml "revisa esta configuración"
+```
+
+`--image <RUTA>` (repetible) adjunta imágenes multimodales. El tipo MIME se
+deduce de la extensión (`png`, `jpg`/`jpeg`, `gif`, `webp`). Con `openai` la
+imagen se envía como *content part* con un *data URL*
+(`data:<mime>;base64,<datos>`); con `ollama` se envía en el campo `images` del
+mensaje:
+
+```bash
+# Analizar una captura de pantalla
+dime --image captura.png "explica qué muestra esta captura"
+
+# Varias imágenes
+dime --image antes.png --image despues.png "describe las diferencias"
+```
+
+Un fichero inexistente/no UTF-8 o una imagen ilegible/con extensión no
+soportada muestran un error legible y terminan con código distinto de cero,
+**sin** realizar la petición.
+
+### Copiar la respuesta al portapapeles
+
+Con `--copy`, la respuesta se copia al portapapeles además de imprimirse. Es
+*best-effort*: si el portapapeles no está disponible (por ejemplo en un entorno
+*headless*), se advierte por `stderr` y el comando termina con código `0`. En
+modo `--json` se copia el campo `content`.
+
+```bash
+# Copiar la respuesta para pegarla en otro sitio
+dime --copy "escribe un correo de disculpa"
+
+# Con salida JSON: se copia el campo `content`
+dime --copy --json "resume este texto" | jq -r '.content'
+```
+
+> **Limitación en X11:** en X11 **sin** un *clipboard manager* (por ejemplo,
+> `clipman`, `klipper`, `CopyQ`…), el propietario del contenido es el propio
+> proceso; al salir `dime`, el texto no persiste en el portapapeles. Es una
+> limitación de X11, no de `dime`, y no afecta a Wayland, macOS ni Windows, ni a
+> X11 con un *clipboard manager* en ejecución. Mientras `dime` está vivo, el
+> contenido sí es accesible (se conserva el handle del portapapeles hasta el
+> final del programa).
+>
+> Nota: `arboard` puede emitir por `stderr` un aviso (`Clipboard was dropped
+> very quickly after writing`) en algunos gestores; es inofensivo.
+
 ### Argumentos
 
 | Argumento        | Forma Corta | Descripción                                                                                                                                     |
@@ -116,6 +178,9 @@ Consideraciones:
 | `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta e ignora `stdin`.                                     |
 | `--json`         |             | Emite la respuesta como un único objeto JSON en `stdout` con `content`, `model` y `usage` (o `null`).                                            |
 | `--no-color`     |             | Garantiza que la salida no contiene secuencias de escape ANSI.                                                                                   |
+| `--file`         |             | Adjunta el contenido de un fichero como contexto del mensaje (repetible; se respeta el orden). Un fichero inexistente o no UTF-8 produce un error legible y código de salida distinto de cero. |
+| `--image`        |             | Adjunta una imagen multimodal (repetible). Formatos: `png`, `jpg`/`jpeg`, `gif`, `webp`. Con `openai` se envían como *content parts* (`data:<mime>;base64,...`); con `ollama` en el campo `images`. Una imagen ilegible o con extensión no soportada produce un error legible y código distinto de cero. |
+| `--copy`         |             | Copia la respuesta al portapapeles además de imprimirla. Es *best-effort*: si el portapapeles no está disponible (p. ej. entorno *headless*), se advierte por `stderr` y el proceso termina con código `0`. En modo `--json` se copia el campo `content`. |
 | `--completions`  |             | Imprime en `stdout` el script de autocompletado del shell indicado (`bash`, `zsh` o `fish`) y termina. No requiere pregunta, no lee `stdin` ni crea `dime.yml`. Incompatible con la pregunta y con `--list-models`. |
 | `--model`        |             | Sobreescribe `model` de `dime.yml` **sólo para esta invocación**. No reescribe el fichero.                                                        |
 | `--temperature`  |             | Sobreescribe `temperature` de `dime.yml` **sólo para esta invocación**. Debe ser numérica; en caso contrario `clap` da un error de uso.           |
