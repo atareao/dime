@@ -2,8 +2,9 @@
 
 ## Estado
 
-- `development` en **`0.5.0`** con **PLAN-003 COMPLETO (Fases 1–7)** mergeadas (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash). `main` sigue en `0.3.0`; release **`v0.3.0`** publicada (binario `dime-linux-x86_64` + `.sha256`).
-- Tarea pendiente: **promoción `development` → `main` y release `v0.5.0`**.
+- `main` y `development` en **`0.5.0`** (ambos en `fc5a819`), con **PLAN-003 COMPLETO (Fases 1–7)** mergeadas (`cli-overrides` PR #29 squash; `stdin-input` PR #26; `scripting-output` PR #27 squash; `shell-completions` PR #31 squash; `context-input` PR #33 squash; `command-mode` PR #35 squash; `http-mock-tests` PR #37 squash) y promocionadas a `main` vía PR #39 (merge commit). Release **`v0.5.0`** publicada (tag + `release.yml` en verde): binario `dime-linux-x86_64` (11.3 MB) y su `.sha256`.
+- PLAN-003 cerrado y archivado en `plans/PLAN-003-ARCHIVED.md`.
+- Tarea pendiente: revisar/mergear las dos ramas de Dependabot en remoto (`dependabot/cargo/bytes-1.11.1`, `dependabot/cargo/tracing-subscriber-0.3.20`).
 
 ## Historial reciente
 
@@ -16,6 +17,7 @@
 - **PLAN-003 Fase 6** (`command-mode`, nueva spec `command`): `--cmd <objetivo>` usa el rol `COMMAND_SYSTEM_ROLE` (pide sólo el comando) e imprime la respuesta limpia con `clean_command` (fences multilínea/de una línea y backticks envolventes; fence sólo-lenguaje → cadena vacía). Incompatible con pregunta, `--list-models` y `--completions`; no usa `stdin` como contexto. Sin `--exec` **nunca** se ejecuta; con `--exec` se muestra el comando y se pide confirmación con default **negativo**; en `stdin` no-TTY sin `--yes` aborta con código ≠ 0; `--yes` ejecuta sin prompt. `--exec`/`--yes` requieren `--cmd`. Ejecución con `sh -c` y propagación del código del hijo (`128 + señal` en Unix; *fallback* 1 fuera de Unix). Decisión pura `should_execute` (tabla de 16 casos), nueva variante `IABotError::Execution` y 4 tests de integración en `tests/command_mode.rs` (mock HTTP sin TTY). README advierte de *prompt injection* al combinar `--file`/`--image` con `--exec --yes`. Sin re-bump: se mantiene `0.4.0`.
 - **PLAN-003 Fase 7** (`http-mock-tests`, nueva spec `http-testing`): `wiremock = "0.6.5"` **sólo** en `[dev-dependencies]` (el binario release no lo arrastra; `cargo tree -e normal` no lo muestra). `tests/http_mock.rs` con 11 tests que ejecutan el binario contra un mock local y un `dime.yml` temporal (`base_url` → mock, `use_https: false`): chat (POST, ruta, `Authorization: Bearer`, cuerpo `model`/`messages`/`temperature`, respuesta en `stdout`, exit 0), openai con token vacío (exit ≠ 0 sin petición), forma ollama (`options.num_ctx`, `options.temperature`, `content` cadena), `--list-models` (GET al `models_endpoint`, ids en `stdout`) y 401 sin ids, y errores 401/500/200-sin-`choices`/200-no-JSON (exit ≠ 0, `stderr` legible, sin *panic*, petición anclada con `verify()`). Helpers `assert_readable_error`/`assert_single_chat_request` y directorio temporal con guardián `Drop`. Sin cambios en `src/`.
 - **PLAN-003 cierre** (v0.5.0): Fases 1–7 mergeadas; bump `0.4.0` → **`0.5.0`** (`vampus upgrade --minor`, por las features de las Fases 4–6). Plan archivado en `plans/PLAN-003-ARCHIVED.md`; `openspec validate --all` → 9 specs, 0 fallos.
+- **Release `v0.5.0`**: PR #39 `development` → `main` mergeado (merge commit, no squash; `main` y `development` en `fc5a819`). Tag `v0.5.0` creado y pusheado; `release.yml` completó con éxito y la release de GitHub **v0.5.0** está publicada con `dime-linux-x86_64` (11.3 MB) y `dime-linux-x86_64.sha256`. `Cargo.toml` en `0.5.0`; `main` ya no está en `0.3.0`. Poda de ramas locales `feature/*`/`chore/*` (solo quedan `main` y `development`).
 - **PLAN-003 Fase 1** (`cli-overrides`, specs `config` y `chat`): flags `--model`/`--temperature`/`--provider` que pisan `dime.yml` sólo para la invocación (fichero byte a byte intacto), alias `--system` de `-i/--instructions`, `IABot::apply_overrides` aplicado antes de `validate()` (por eso `--provider ollama` exime de token), proveedor inválido → `IABotError::Provider`, `--temperature` no numérica → error de uso de `clap`, `Args::parse()` al inicio de `main` (`--help`/`--version` ya no crean `dime.yml`). Bump a `0.4.0`.
 
 ## Estado del código
@@ -34,7 +36,7 @@
 
 ## Siguiente paso
 
-Promoción `development` → `main` (PR) y release **`v0.5.0`** con el binario y su `.sha256`.
+Revisar y mergear (o cerrar) las dos ramas de Dependabot en remoto: `dependabot/cargo/bytes-1.11.1` y `dependabot/cargo/tracing-subscriber-0.3.20`. Después, atacar los follow-ups técnicos de arriba cuando toque.
 
 ## Flujo
 
