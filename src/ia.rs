@@ -193,6 +193,12 @@ impl IABot {
         &self.system_role
     }
 
+    /// Devuelve el modelo configurado (usado como valor por defecto cuando el
+    /// proveedor no informa el modelo en su respuesta).
+    pub fn get_model(&self) -> &str {
+        &self.model
+    }
+
     /// Indica si el proveedor configurado es Ollama (comparación insensible a mayúsculas).
     fn is_ollama(&self) -> bool {
         self.provider.eq_ignore_ascii_case("ollama")
@@ -270,7 +276,7 @@ impl IABot {
     }
 
     /// Envía la pregunta al proveedor y devuelve su respuesta.
-    pub async fn ask(&self, system: &str, question: &str) -> Result<String, IABotError> {
+    pub async fn ask(&self, system: &str, question: &str) -> Result<ChatResponse, IABotError> {
         let url = self.build_url();
         debug!("Url: {}", url);
         debug!("Provider: {}", self.provider);
@@ -353,9 +359,29 @@ impl IABot {
     }
 }
 
+/// Respuesta de chat con metadatos, lista para serializar.
+///
+/// `content` es la respuesta del modelo; `model` es el modelo efectivamente
+/// usado y `usage` es el objeto de uso tal cual lo devuelve el proveedor
+/// (opaco). Cuando el proveedor no aporta `model` o `usage`, el campo es
+/// `None` y se serializa como `null`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatResponse {
+    /// Contenido textual de la respuesta.
+    pub content: String,
+    /// Modelo usado por el proveedor, si lo informa.
+    pub model: Option<String>,
+    /// Objeto de uso crudo del proveedor, si lo informa.
+    pub usage: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
+struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,17 +401,27 @@ struct ApiErrorBody {
 
 /// Interpreta el cuerpo de una respuesta de chat.
 ///
-/// Primero intenta el error del proveedor y después la respuesta estándar.
-/// El campo `error` puede ser un objeto con `message` o una cadena.
+/// Primero intenta el error del proveedor y después la respuesta estándar,
+/// devolviendo el contenido junto con el modelo y el objeto de uso cuando están
+/// presentes. El campo `error` puede ser un objeto con `message` o una cadena.
 /// Cualquier otra forma devuelve [`IABotError::UnexpectedResponse`], nunca un *panic*.
-fn parse_response(body: &str) -> Result<String, IABotError> {
+fn parse_response(body: &str) -> Result<ChatResponse, IABotError> {
     if let Some(err) = extract_api_error(body) {
         return Err(err);
     }
 
-    if let Ok(response) = serde_json::from_str::<ChatResponse>(body) {
-        if let Some(choice) = response.choices.into_iter().next() {
-            return Ok(choice.message.content);
+    if let Ok(response) = serde_json::from_str::<ApiChatResponse>(body) {
+        let ApiChatResponse {
+            choices,
+            model,
+            usage,
+        } = response;
+        if let Some(choice) = choices.into_iter().next() {
+            return Ok(ChatResponse {
+                content: choice.message.content,
+                model,
+                usage,
+            });
         }
     }
 
@@ -557,7 +593,28 @@ mod tests {
     #[test]
     fn parse_response_ok_returns_content() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"Hola"}}]}"#;
-        assert_eq!(parse_response(body).unwrap(), "Hola");
+        assert_eq!(parse_response(body).unwrap().content, "Hola");
+    }
+
+    // --- output/chat spec: respuesta con metadatos ---
+
+    #[test]
+    fn parse_response_exposes_content_model_and_usage() {
+        let body = r#"{"model":"gpt-4o","usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7},"choices":[{"message":{"role":"assistant","content":"Hola"}}]}"#;
+        let response = parse_response(body).expect("respuesta");
+        assert_eq!(response.content, "Hola");
+        assert_eq!(response.model.as_deref(), Some("gpt-4o"));
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage["total_tokens"], 7);
+    }
+
+    #[test]
+    fn parse_response_without_usage_has_none_usage() {
+        let body = r#"{"choices":[{"message":{"content":"Hola"}}]}"#;
+        let response = parse_response(body).expect("respuesta");
+        assert_eq!(response.content, "Hola");
+        assert!(response.model.is_none());
+        assert!(response.usage.is_none());
     }
 
     #[test]
@@ -828,7 +885,7 @@ mod tests {
     #[test]
     fn parse_response_null_error_falls_back_to_choices() {
         let body = r#"{"error":null,"choices":[{"message":{"content":"Hola"}}]}"#;
-        assert_eq!(parse_response(body).unwrap(), "Hola");
+        assert_eq!(parse_response(body).unwrap().content, "Hola");
     }
 
     // --- MENOR 2: no existe dime.yml -> se crea con defaults ---

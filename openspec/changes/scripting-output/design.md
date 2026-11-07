@@ -14,7 +14,7 @@ Ver proposal.md y plans/PLAN-003.md (Fase 3). Hoy IABot::ask devuelve un String 
 
 ### D1. ask devuelve contenido + metadatos
 
-Se introduce un tipo de respuesta (p. ej. ChatResponse { content: String, model: Option<String>, usage: Option<serde_json::Value> }). main decide cómo imprimirlo.
+Se introduce un tipo de respuesta (p. ej. ChatResponse { content: String, model: Option<String>, usage: Option<serde_json::Value> }). main decide cómo imprimirlo. En la salida JSON, `model` se resuelve a una cadena: el modelo informado por el proveedor o, si falta, el modelo configurado en `IABot`.
 
 - Alternativa: mantener String y una segunda llamada para metadatos. Descartada: duplicaría la petición.
 
