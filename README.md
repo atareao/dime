@@ -58,7 +58,7 @@ El archivo de configuración utiliza formato `YAML` e incluye los parámetros ne
 
 ## 💻 Uso
 
-La aplicación utiliza un argumento obligatorio para la pregunta y uno opcional para definir el rol de la IA. La pregunta puede pasarse como argumento posicional o con `--question`. Si no se pasa `--instructions`, se usa `system_role` desde la configuración.
+La pregunta puede pasarse como argumento posicional, con `--question` o por `stdin` (tubería/redirección). El rol de la IA es opcional: si no se pasa `--instructions`, se usa `system_role` desde la configuración.
 
 ### Sintaxis
 
@@ -70,14 +70,43 @@ dime -i <INSTRUCCIONES> <PREGUNTA>
 dime --list-models
 ```
 
+### Entrada por tubería o redirección
+
+Cuando no se aporta pregunta y `stdin` no es un terminal (TTY), **dime** lee la
+pregunta de `stdin`. También puedes forzarlo con `-` como pregunta. Si aportas
+la pregunta y además canalizas datos, el contenido de `stdin` se añade como
+**contexto** al mensaje de usuario (el rol del sistema no cambia).
+
+```bash
+# La pregunta viene de stdin
+echo "A que huelen las nubes" | dime
+
+# Marcador `-` para forzar la lectura desde stdin
+dime - < pregunta.txt
+
+# Pregunta + contexto canalizado (el diff se añade como contexto)
+git diff | dime "resume estos cambios"
+
+# Redirección desde fichero como contexto
+dime "explica" < README.md
+```
+
+Consideraciones:
+
+- En uso **interactivo** (TTY) sin pregunta, se muestra un error de uso y el
+  proceso termina con código distinto de cero, sin leer de `stdin`.
+- Si `stdin` no es un TTY, no aporta datos (EOF inmediato) y no hay pregunta,
+  se muestra un error legible y el proceso termina con código distinto de cero.
+- `--list-models` **ignora** `stdin`: nunca se bloquea esperando datos.
+
 ### Argumentos
 
 | Argumento        | Forma Corta | Descripción                                                                                                                                     |
 | :--------------- | :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--instructions` | `-i`        | Instrucciones de comportamiento para el modelo (rol del sistema). Opcional; si no se indica, se usa `system_role` del archivo de configuración. |
-| `--question`     | `-q`        | La pregunta o solicitud que deseas realizar. Opcional si se pasa como argumento posicional.                                                     |
-| `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta.                                                    |
-| `QUESTION`       |             | La pregunta o solicitud que deseas realizar como argumento posicional.                                                                          |
+| `--question`     | `-q`        | La pregunta o solicitud que deseas realizar. Opcional si se pasa como argumento posicional o si se lee de `stdin`.                                    |
+| `--list-models`  |             | Lista los modelos disponibles del proveedor (uno por línea) y termina. No requiere pregunta e ignora `stdin`.                                     |
+| `QUESTION`       |             | La pregunta o solicitud que deseas realizar como argumento posicional. Usa `-` para forzar la lectura desde `stdin`.                            |
 
 ### Ejemplo
 
