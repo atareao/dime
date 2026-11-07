@@ -39,12 +39,13 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 - Spec nueva: `completions`.
 - Criterio: `dime --completions bash` imprime un script válido.
 
-### Fase 5 — Contexto: ficheros, imágenes y clipboard (cambio `context-input`)
+### Fase 5 — Contexto: ficheros, imágenes y clipboard (cambio `context-input`) — ✅ Completada (PR #33 squash → `development`)
 
 `--file <ruta>` (repetible), `--image <ruta>` (repetible; multimodal) y `--copy` (copiar la respuesta al portapapeles). Imágenes: OpenAI (content parts con data URL base64) y Ollama (`images`).
-- Specs: `chat` (mensajes con contexto), `config`.
+- Specs: nuevas `attachments` y `clipboard`; modifica `chat` (mensajes con contexto) y `config`.
 - Criterio: `dime --file README.md "resume"` incluye el contenido; `--image` envía la imagen; `--copy` copia la respuesta.
 - Dependencias: `arboard` (clipboard) y `base64`.
+- Limitación conocida: en X11 sin *clipboard manager* el contenido no persiste tras salir el proceso.
 
 ### Fase 6 — Modo comando (cambio `command-mode`)
 
@@ -60,15 +61,15 @@ Con `clap_complete`: `--completions <bash|zsh|fish>` imprime el script de comple
 
 ## Criterios de aceptación globales
 
-- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–4 cumplen el criterio; pendientes Fases 5–7)*
-- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–4)*
-- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–4)*
+- [ ] Cada fase: cambio OpenSpec aprobado antes del código, tests, `fmt` y `clippy` verdes, PR a `development`. *(Fases 1–5 cumplen el criterio; pendientes Fases 6–7)*
+- [x] Sin regresiones en las specs existentes (`config`, `chat`, `models`). *(verificado tras las Fases 1–5)*
+- [x] Documentación en `docs/` y `HANDOFF.md` actualizado al cerrar cada fase. *(cerrada para las Fases 1–5)*
 
 ## Riesgos
 
-- Fases 5 y 6 (imágenes y ejecución de comandos) tienen la mayor superficie: exigen specs de formato y de seguridad.
+- La Fase 6 (ejecución de comandos) tiene la mayor superficie: exige una spec explícita de seguridad.
 - Aumento del número de flags: mantener la ayuda de `clap` clara y los conflictos bien definidos.
 
 ## Versionado
 
-**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). La **Fase 4** se ha mergeado **sin re-bumpear**: se mantiene `0.4.0`. Las Fases 5–7 en incrementos posteriores.
+**`0.4.0`** alcanzado al cerrar las **Fases 1–3** (Fases 2–3 se mergearon sin bumpear; el bump a `0.4.0` se hizo con la Fase 1). Las **Fases 4 y 5** se han mergeado **sin re-bumpear**: se mantiene `0.4.0`. Las Fases 6–7 en incrementos posteriores.
