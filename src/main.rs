@@ -1,7 +1,9 @@
 mod ia;
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use ia::{compose_user_message, ChatResponse, IABot, IABotError};
+use ia::{
+    compose_context, compose_user_message, read_files, read_images, ChatResponse, IABot, IABotError,
+};
 use std::io::{self, IsTerminal, Read, Write};
 use std::{env, str::FromStr};
 use std::{path::PathBuf, process};
@@ -47,6 +49,18 @@ struct Args {
     /// Garantiza que la salida no contiene secuencias de escape ANSI
     #[arg(long = "no-color")]
     no_color: bool,
+
+    /// Adjunta el contenido de un fichero como contexto del mensaje (repetible)
+    #[arg(long = "file", value_name = "RUTA")]
+    files: Vec<PathBuf>,
+
+    /// Adjunta una imagen multimodal (repetible); formato png, jpg, jpeg, gif o webp
+    #[arg(long = "image", value_name = "RUTA")]
+    images: Vec<PathBuf>,
+
+    /// Copia la respuesta al portapapeles además de imprimirla (best-effort)
+    #[arg(long = "copy")]
+    copy: bool,
 
     /// Imprime el script de autocompletado del shell indicado y termina
     ///
@@ -150,6 +164,25 @@ fn resolve_input(
                 context: data.trim_end().to_string(),
             }),
         },
+    }
+}
+
+/// Compone el texto de usuario final: pregunta más contexto de `stdin` más el
+/// contexto de los ficheros adjuntos, en ese orden.
+///
+/// El bloque de ficheros se añade DESPUÉS del contexto de `stdin` (respetando el
+/// orden de `--file`). Sin ficheros equivale a [`compose_user_message`].
+fn compose_user_text(
+    question: &str,
+    stdin_context: Option<&str>,
+    files: &[(String, String)],
+) -> String {
+    let base = compose_user_message(question, stdin_context);
+    let context = compose_context(files);
+    if context.is_empty() {
+        base
+    } else {
+        format!("{base}\n\n{context}")
     }
 }
 
@@ -276,16 +309,44 @@ async fn main() {
         }
     };
 
-    let question = match resolved {
-        ResolvedInput::Question(question) => question,
-        ResolvedInput::QuestionWithContext { question, context } => {
-            compose_user_message(&question, Some(&context))
+    let (question, stdin_context) = match resolved {
+        ResolvedInput::Question(question) => (question, None),
+        ResolvedInput::QuestionWithContext { question, context } => (question, Some(context)),
+    };
+
+    // Los adjuntos se leen antes de la petición: un fichero o una imagen
+    // ilegible termina con código distinto de cero sin contactar al proveedor.
+    let files = match read_files(&args.files).await {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+    let images = match read_images(&args.images).await {
+        Ok(images) => images,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
         }
     };
 
-    match iabot.ask(system_role, &question).await {
+    let user_text = compose_user_text(&question, stdin_context.as_deref(), &files);
+
+    // En X11 sin *clipboard manager*, el proceso es el dueño del contenido: hay
+    // que mantener el handle vivo hasta el final de `main` para no perderlo.
+    let mut clipboard_guard: Option<arboard::Clipboard> = None;
+
+    match iabot.ask(system_role, &user_text, &images).await {
         Ok(response) => {
             println!("{}", render_output(&response, args.json, iabot.get_model()));
+            if args.copy {
+                // Best-effort: un fallo del portapapeles sólo advierte por stderr.
+                let stderr = io::stderr();
+                let mut handle = stderr.lock();
+                clipboard_guard =
+                    report_copy_result(copy_to_clipboard(&clipboard_text(&response)), &mut handle);
+            }
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -293,6 +354,9 @@ async fn main() {
             process::exit(1);
         }
     }
+
+    // El guardián del portapapeles se suelta aquí, al final de `main`.
+    drop(clipboard_guard);
 }
 
 /// Lee todo `stdin` como texto UTF-8.
@@ -325,6 +389,59 @@ fn render_output(response: &ChatResponse, json: bool, default_model: &str) -> St
         .to_string()
     } else {
         response.content.clone()
+    }
+}
+
+/// Copia `text` al portapapeles del sistema y devuelve el handle vivo.
+///
+/// Es *best-effort*: devuelve [`IABotError::Clipboard`] si el portapapeles no
+/// está disponible (p. ej. entorno *headless*), sin *panic*.
+///
+/// El [`arboard::Clipboard`] **se devuelve** en lugar de soltarse aquí: en X11
+/// sin *clipboard manager* el proceso es el dueño del contenido y soltar el
+/// handle inmediatamente tras `set_text` perdería el texto. El llamante debe
+/// mantenerlo vivo hasta el final de `main`.
+pub fn copy_to_clipboard(text: &str) -> Result<arboard::Clipboard, IABotError> {
+    copy_to_clipboard_with(text, |text| {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        clipboard.set_text(text).map_err(|e| e.to_string())?;
+        Ok(clipboard)
+    })
+}
+
+/// Variante de [`copy_to_clipboard`] con la escritura inyectada.
+///
+/// Es genérica sobre el valor de éxito: propaga el valor que devuelve `write`
+/// (el handle del portapapeles real en producción) para que el llamante pueda
+/// conservarlo vivo. También permite testear de forma determinista el camino de
+/// error sin depender de un portapapeles real.
+fn copy_to_clipboard_with<T, F>(text: &str, write: F) -> Result<T, IABotError>
+where
+    F: FnOnce(&str) -> Result<T, String>,
+{
+    write(text).map_err(IABotError::Clipboard)
+}
+
+/// Texto que se copia al portapapeles con `--copy`.
+///
+/// Es siempre el campo `content` de la respuesta: en modo `--json` se copia ese
+/// campo (no el objeto JSON completo) y en modo normal coincide con el texto
+/// impreso.
+fn clipboard_text(response: &ChatResponse) -> String {
+    response.content.clone()
+}
+
+/// Advierte por `warn` si la copia falló y propaga el guardián del portapapeles.
+///
+/// El comando nunca falla por un portapapeles no disponible: sólo advierte. En
+/// éxito devuelve `Some(guard)` para que el llamante lo mantenga vivo.
+fn report_copy_result<T>(result: Result<T, IABotError>, warn: &mut dyn Write) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let _ = writeln!(warn, "Aviso: {e}");
+            None
+        }
     }
 }
 
@@ -720,5 +837,152 @@ mod tests {
             assert!(!script.trim().is_empty(), "script vacío para {shell:?}");
             assert!(script.contains("dime"), "script sin `dime` para {shell:?}");
         }
+    }
+
+    // --- attachments spec: flags ---
+
+    #[test]
+    fn file_flag_is_repeatable() {
+        let args = Args::try_parse_from(["dime", "--file", "a.txt", "--file", "b.txt", "hola"])
+            .expect("parse");
+        assert_eq!(
+            args.files,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
+    }
+
+    #[test]
+    fn image_flag_is_repeatable() {
+        let args = Args::try_parse_from(["dime", "--image", "a.png", "--image", "b.jpg", "hola"])
+            .expect("parse");
+        assert_eq!(
+            args.images,
+            vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")]
+        );
+    }
+
+    #[test]
+    fn file_and_image_flags_default_to_empty() {
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(args.files.is_empty());
+        assert!(args.images.is_empty());
+    }
+
+    // --- attachments spec: Composición del mensaje de usuario ---
+
+    #[test]
+    fn compose_user_text_without_files_is_question_with_stdin_context() {
+        let text = compose_user_text("resume", Some("stdin ctx"), &[]);
+        assert_eq!(text, "resume\n\nstdin ctx");
+    }
+
+    #[test]
+    fn compose_user_text_without_context_or_files_is_plain_question() {
+        assert_eq!(compose_user_text("resume", None, &[]), "resume");
+    }
+
+    #[test]
+    fn compose_user_text_appends_files_after_stdin_context() {
+        let files = vec![("a.txt".to_string(), "contenido A".to_string())];
+        let text = compose_user_text("resume", Some("stdin ctx"), &files);
+        let pos_question = text.find("resume").expect("pregunta");
+        let pos_stdin = text.find("stdin ctx").expect("stdin");
+        let pos_file = text.find("contenido A").expect("fichero");
+        assert!(pos_question < pos_stdin, "texto: {text}");
+        assert!(
+            pos_stdin < pos_file,
+            "el fichero debe ir tras stdin: {text}"
+        );
+    }
+
+    // --- clipboard spec: flags ---
+
+    #[test]
+    fn copy_flag_parses_and_defaults_to_false() {
+        let args = Args::try_parse_from(["dime", "--copy", "hola"]).expect("parse");
+        assert!(args.copy);
+        let args = Args::try_parse_from(["dime", "hola"]).expect("parse");
+        assert!(!args.copy);
+    }
+
+    // --- clipboard spec: Copia best-effort ---
+
+    #[test]
+    fn copy_to_clipboard_with_success_records_text() {
+        let mut captured = String::new();
+        copy_to_clipboard_with("respuesta", |text| {
+            captured = text.to_string();
+            Ok(())
+        })
+        .expect("copia correcta");
+        assert_eq!(captured, "respuesta");
+    }
+
+    #[test]
+    fn copy_to_clipboard_with_returns_guard_from_writer() {
+        // El guardián (p. ej. el `Clipboard` vivo) debe propagarse al llamante
+        // para que NO se libere dentro del helper: en X11 sin clipboard manager,
+        // soltar el `Clipboard` de inmediato pierde el contenido.
+        let guard = copy_to_clipboard_with("respuesta", |_| Ok("GUARD")).expect("copia correcta");
+        assert_eq!(guard, "GUARD");
+    }
+
+    #[test]
+    fn report_copy_result_returns_guard_on_success() {
+        let mut buf: Vec<u8> = Vec::new();
+        let guard = report_copy_result(Ok("GUARD"), &mut buf);
+        assert_eq!(guard, Some("GUARD"));
+        assert!(buf.is_empty(), "no debe advertir en éxito");
+    }
+
+    #[test]
+    fn clipboard_text_is_content_field_not_json_object() {
+        let response = chat_response();
+        let json_output = render_output(&response, true, "gpt-3.5-turbo");
+        assert!(json_output.starts_with('{'), "salida JSON: {json_output}");
+        assert_eq!(clipboard_text(&response), "Hola");
+    }
+
+    #[test]
+    fn copy_to_clipboard_with_failure_returns_clipboard_error() {
+        let err =
+            copy_to_clipboard_with::<(), _>("respuesta", |_| Err("sin portapapeles".to_string()))
+                .unwrap_err();
+        assert!(matches!(err, IABotError::Clipboard(_)), "err: {err}");
+        assert!(err.to_string().contains("sin portapapeles"), "err: {err}");
+    }
+
+    #[test]
+    fn report_copy_result_success_writes_nothing() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_copy_result::<()>(Ok(()), &mut buf);
+        assert!(buf.is_empty(), "no debe advertir en éxito");
+    }
+
+    /// Roundtrip real con el portapapeles del sistema.
+    ///
+    /// Se marca `#[ignore]` porque requiere un portapapeles real (no hay uno en
+    /// CI/entornos *headless*). Se ejecuta a mano con `cargo test -- --ignored`
+    /// para demostrar que el guardián devuelto por [`copy_to_clipboard`] mantiene
+    /// el texto legible mientras sigue vivo.
+    #[test]
+    #[ignore = "requiere un portapapeles real; ejecutar con --ignored"]
+    fn clipboard_roundtrip_keeps_text_while_guard_alive() {
+        let guard = copy_to_clipboard("DIME_ROUNDTRIP").expect("portapapeles disponible");
+        let mut reader = arboard::Clipboard::new().expect("segundo handle del portapapeles");
+        assert_eq!(
+            reader.get_text().expect("leer portapapeles"),
+            "DIME_ROUNDTRIP"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn report_copy_result_failure_writes_warning_to_stderr_writer() {
+        let mut buf: Vec<u8> = Vec::new();
+        report_copy_result::<()>(Err(IABotError::Clipboard("headless".to_string())), &mut buf);
+        let warning = String::from_utf8(buf).expect("utf8");
+        assert!(warning.contains("Aviso"), "aviso: {warning}");
+        assert!(warning.contains("headless"), "aviso: {warning}");
     }
 }

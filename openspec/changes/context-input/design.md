@@ -34,6 +34,21 @@ Sin imágenes, `content` sigue siendo una cadena (no rompe peticiones ni tests e
 
 Se copia tras imprimir. Es *best-effort*: si el portapapeles falla (p. ej. entorno headless), se advierte por `stderr` y se continúa con código 0. La operación se aísla en una función `copy_to_clipboard(text) -> Result<(), ...>` para poder testear el camino de error.
 
+**Lifetime del `Clipboard` (defecto corregido):** el handle de `arboard::Clipboard`
+NO debe soltarse dentro del helper. En X11 sin *clipboard manager* el proceso es
+el propietario del contenido y soltarlo justo tras `set_text` pierde el texto
+(`set_text` devuelve `Ok`, así que sería un fallo silencioso). Por eso
+`copy_to_clipboard` **devuelve** el `Clipboard` y `main` lo mantiene vivo hasta el
+final. El helper de test recibe la escritura inyectada y es genérico sobre el
+valor de éxito, de modo que propaga el guardián y el camino de error sigue siendo
+testeable de forma determinista.
+
+**Limitación inherente (documentada, no es un bug):** en X11 **sin** *clipboard
+manager* el contenido no persiste tras la salida del proceso (limitación de X11:
+el dueño es el proceso). Funciona en Wayland/macOS/Windows y en X11 con manager.
+No se añade ningún `wait()` bloqueante.
+
+
 ### D5. Errores
 
 Se añade una variante tipada (p. ej. `IABotError::Attachment`) con mensaje legible; nunca se entra en *panic*.

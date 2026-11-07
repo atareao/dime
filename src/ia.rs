@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs::read_to_string;
 use tracing::{debug, error, info};
 
@@ -34,6 +34,18 @@ pub enum IABotError {
     /// no se usa [`IABotError::Config`].
     #[error("proveedor no soportado: `{0}`; valores válidos: `openai`, `ollama`")]
     Provider(String),
+    /// Un adjunto (`--file` o `--image`) no se pudo leer o no es válido.
+    ///
+    /// Cubre ficheros inexistentes o no UTF-8, imágenes ilegibles y extensiones
+    /// de imagen no soportadas.
+    #[error("Error con el adjunto: {0}")]
+    Attachment(String),
+    /// No se pudo escribir en el portapapeles (`--copy`).
+    ///
+    /// Es *best-effort*: el llamante advierte y continúa con código de salida
+    /// cero, por lo que nunca interrumpe el comando.
+    #[error("No se pudo copiar al portapapeles: {0}")]
+    Clipboard(String),
 }
 
 /// Compone el mensaje de usuario concatenando la pregunta con un contexto
@@ -47,6 +59,98 @@ pub fn compose_user_message(question: &str, context: Option<&str>) -> String {
         Some(context) if !context.is_empty() => format!("{question}\n\n{context}"),
         _ => question.to_string(),
     }
+}
+
+/// Un adjunto de imagen listo para enviar al proveedor.
+///
+/// `data` es la imagen ya codificada en base64 y `mime` su tipo MIME deducido
+/// de la extensión (`image/png`, `image/jpeg`, `image/gif` o `image/webp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// Tipo MIME de la imagen (p. ej. `image/png`).
+    pub mime: String,
+    /// Contenido de la imagen codificado en base64 (sin prefijo *data URL*).
+    pub data: String,
+}
+
+/// Compone el bloque de contexto a partir de una lista de `(ruta, contenido)`.
+///
+/// Cada fichero se precede de una cabecera `## <ruta>` seguida del contenido
+/// recortado por la derecha. Los ficheros se separan con una línea en blanco y
+/// se respeta el orden recibido. Sin ficheros devuelve una cadena vacía.
+pub fn compose_context(files: &[(String, String)]) -> String {
+    files
+        .iter()
+        .map(|(path, content)| format!("## {path}\n\n{}", content.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Lee cada ruta como texto UTF-8 y devuelve pares `(ruta, contenido)` en orden.
+///
+/// Un fichero inexistente o no UTF-8 produce [`IABotError::Attachment`] con un
+/// mensaje legible, sin *panic*.
+pub async fn read_files(paths: &[PathBuf]) -> Result<Vec<(String, String)>, IABotError> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let content = read_to_string(path).await.map_err(|e| {
+            IABotError::Attachment(format!(
+                "no se pudo leer el fichero `{}` como texto UTF-8: {e}",
+                path.display()
+            ))
+        })?;
+        files.push((path.display().to_string(), content));
+    }
+    Ok(files)
+}
+
+/// Deducir el MIME de una imagen a partir de su extensión.
+///
+/// Reconoce `png`, `jpg`/`jpeg`, `gif` y `webp` (insensible a mayúsculas).
+/// Cualquier otra extensión, o la ausencia de ella, produce
+/// [`IABotError::Attachment`].
+pub fn mime_from_path(path: &Path) -> Result<&'static str, IABotError> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" => Ok("image/png"),
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "gif" => Ok("image/gif"),
+        "webp" => Ok("image/webp"),
+        _ => Err(IABotError::Attachment(format!(
+            "extensión de imagen no soportada en `{}`; usa png, jpg, jpeg, gif o webp",
+            path.display()
+        ))),
+    }
+}
+
+/// Lee cada imagen, la codifica en base64 y deduce su MIME por extensión.
+///
+/// Una imagen inexistente, ilegible o con extensión no soportada produce
+/// [`IABotError::Attachment`].
+pub async fn read_images(paths: &[PathBuf]) -> Result<Vec<ImageAttachment>, IABotError> {
+    use base64::Engine;
+
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mime = mime_from_path(path)?;
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            IABotError::Attachment(format!(
+                "no se pudo leer la imagen `{}`: {e}",
+                path.display()
+            ))
+        })?;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        images.push(ImageAttachment {
+            mime: mime.to_string(),
+            data,
+        });
+    }
+    Ok(images)
 }
 
 /// Cliente de chat para proveedores compatibles con la API de OpenAI.
@@ -289,14 +393,36 @@ impl IABot {
 
     /// Construye el cuerpo JSON de la petición sin tocar la red.
     ///
-    /// - `openai`: `temperature` en el nivel superior.
-    /// - `ollama`: `temperature` y `num_ctx` dentro de `options`.
-    fn build_body(&self, system: &str, question: &str) -> Result<String, IABotError> {
+    /// - `openai`: `temperature` en el nivel superior. El `content` del mensaje
+    ///   `user` es una cadena cuando no hay imágenes y un array de content parts
+    ///   (texto + `image_url` como *data URL* base64) cuando las hay.
+    /// - `ollama`: `temperature` y `num_ctx` dentro de `options`; las imágenes
+    ///   van en el campo `images` del mensaje `user` y `content` sigue siendo
+    ///   una cadena de texto.
+    fn build_body(
+        &self,
+        system: &str,
+        question: &str,
+        images: &[ImageAttachment],
+    ) -> Result<String, IABotError> {
         let temperature = self.temperature;
+
+        let user_message = if self.is_ollama() {
+            let mut message = json!({"role": "user", "content": question});
+            if !images.is_empty() {
+                if let Some(object) = message.as_object_mut() {
+                    let data: Vec<&str> = images.iter().map(|image| image.data.as_str()).collect();
+                    object.insert("images".to_string(), json!(data));
+                }
+            }
+            message
+        } else {
+            json!({"role": "user", "content": self.openai_content(question, images)})
+        };
 
         let messages = json!([
             {"role": "system", "content": system},
-            {"role": "user", "content": question}
+            user_message
         ]);
 
         let payload = if self.is_ollama() {
@@ -319,14 +445,41 @@ impl IABot {
         serde_json::to_string(&payload).map_err(|e| IABotError::Http(e.to_string()))
     }
 
+    /// Compone el `content` del mensaje `user` para `openai`.
+    ///
+    /// Sin imágenes devuelve la cadena de texto (compatibilidad con peticiones y
+    /// tests existentes). Con imágenes devuelve un array de content parts con la
+    /// primera parte de texto y una parte `image_url` por cada imagen.
+    fn openai_content(&self, question: &str, images: &[ImageAttachment]) -> serde_json::Value {
+        if images.is_empty() {
+            return json!(question);
+        }
+
+        let mut parts = vec![json!({"type": "text", "text": question})];
+        parts.extend(images.iter().map(|image| {
+            json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime, image.data)
+                }
+            })
+        }));
+        json!(parts)
+    }
+
     /// Envía la pregunta al proveedor y devuelve su respuesta.
-    pub async fn ask(&self, system: &str, question: &str) -> Result<ChatResponse, IABotError> {
+    pub async fn ask(
+        &self,
+        system: &str,
+        question: &str,
+        images: &[ImageAttachment],
+    ) -> Result<ChatResponse, IABotError> {
         let url = self.build_url();
         debug!("Url: {}", url);
         debug!("Provider: {}", self.provider);
         debug!("Question: {}", question);
 
-        let body = self.build_body(system, question)?;
+        let body = self.build_body(system, question, images)?;
 
         let client = Client::new();
         let mut request_builder = client.post(&url).header("Content-Type", "application/json");
@@ -599,7 +752,7 @@ mod tests {
 
     #[test]
     fn build_body_openai_has_messages_and_temperature_at_top_level() {
-        let body = openai_bot().build_body("sys", "hola").expect("body");
+        let body = openai_bot().build_body("sys", "hola", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["model"], "gpt-3.5-turbo");
         assert_eq!(v["messages"][0]["role"], "system");
@@ -614,7 +767,7 @@ mod tests {
 
     #[test]
     fn build_body_ollama_puts_num_ctx_and_temperature_in_options() {
-        let body = ollama_bot().build_body("sys", "hola").expect("body");
+        let body = ollama_bot().build_body("sys", "hola", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["options"]["num_ctx"], 32000);
         assert_eq!(v["options"]["temperature"], serde_json::json!(1.0));
@@ -627,9 +780,62 @@ mod tests {
     fn build_body_uses_configured_temperature() {
         let mut b = bot();
         b.temperature = 0.2;
-        let body = b.build_body("sys", "q").expect("body");
+        let body = b.build_body("sys", "q", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.2));
+    }
+
+    // --- attachments/chat spec: Imágenes multimodales ---
+
+    fn image(mime: &str, data: &str) -> ImageAttachment {
+        ImageAttachment {
+            mime: mime.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_body_openai_with_image_uses_content_parts() {
+        let images = vec![image("image/png", "UE5HREFUQQ==")];
+        let body = openai_bot()
+            .build_body("sys", "describe", &images)
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let content = &v["messages"][1]["content"];
+        assert!(content.is_array(), "content debe ser array: {content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().expect("url");
+        assert!(url.starts_with("data:image/png;base64,"), "url: {url}");
+    }
+
+    #[test]
+    fn build_body_ollama_with_image_uses_images_field_and_string_content() {
+        let images = vec![image("image/png", "UE5HREFUQQ==")];
+        let body = ollama_bot()
+            .build_body("sys", "describe", &images)
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let user = &v["messages"][1];
+        assert!(user["content"].is_string(), "content: {}", user["content"]);
+        assert_eq!(user["content"], "describe");
+        assert_eq!(user["images"][0], "UE5HREFUQQ==");
+    }
+
+    #[test]
+    fn build_body_openai_without_images_keeps_content_as_string() {
+        let body = openai_bot().build_body("sys", "hola", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["messages"][1]["content"].is_string());
+        assert_eq!(v["messages"][1]["content"], "hola");
+    }
+
+    #[test]
+    fn build_body_ollama_without_images_omits_images_field() {
+        let body = ollama_bot().build_body("sys", "hola", &[]).expect("body");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["messages"][1].get("images").is_none());
     }
 
     // --- chat spec: Tratamiento de respuestas ---
@@ -983,7 +1189,7 @@ mod tests {
         let mut b = openai_bot();
         b.apply_overrides(None, Some(0.2), None)
             .expect("override de temperatura");
-        let body = b.build_body("sys", "q").expect("body");
+        let body = b.build_body("sys", "q", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.2));
         assert_eq!(v["model"], "gpt-3.5-turbo");
@@ -1024,11 +1230,150 @@ mod tests {
         assert!(b.validate().is_ok(), "ollama no debe exigir token");
         assert_eq!(b.auth_header(), None, "ollama no envía Authorization");
 
-        let body = b.build_body("sys", "hola").expect("body");
+        let body = b.build_body("sys", "hola", &[]).expect("body");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["options"]["num_ctx"], 32000);
         assert_eq!(v["options"]["temperature"], serde_json::json!(0.2));
         assert!(v.get("temperature").is_none());
+    }
+
+    // --- attachments spec: Contexto desde ficheros ---
+
+    fn temp_path(suffix: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dime-attach-{}-{}-{}",
+            std::process::id(),
+            n,
+            suffix
+        ));
+        path
+    }
+
+    #[test]
+    fn compose_context_single_file_has_header_and_content() {
+        let files = vec![("README.md".to_string(), "hola mundo".to_string())];
+        let context = compose_context(&files);
+        assert!(context.contains("## README.md"), "contexto: {context}");
+        assert!(context.contains("hola mundo"), "contexto: {context}");
+    }
+
+    #[test]
+    fn compose_context_preserves_order() {
+        let files = vec![
+            ("a.txt".to_string(), "contenido A".to_string()),
+            ("b.txt".to_string(), "contenido B".to_string()),
+        ];
+        let context = compose_context(&files);
+        let pos_a = context.find("a.txt").expect("a.txt presente");
+        let pos_b = context.find("b.txt").expect("b.txt presente");
+        assert!(pos_a < pos_b, "a.txt debe ir antes que b.txt: {context}");
+    }
+
+    #[test]
+    fn compose_context_empty_is_empty() {
+        assert_eq!(compose_context(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn read_files_reads_contents_in_order() {
+        let a = temp_path("a.txt");
+        let b = temp_path("b.txt");
+        std::fs::write(&a, "contenido A").expect("write a");
+        std::fs::write(&b, "contenido B").expect("write b");
+
+        let files = read_files(&[a.clone(), b.clone()])
+            .await
+            .expect("lectura correcta");
+
+        assert_eq!(files.len(), 2);
+        assert!(files[0].0.ends_with("a.txt"), "ruta 0: {}", files[0].0);
+        assert_eq!(files[0].1, "contenido A");
+        assert_eq!(files[1].1, "contenido B");
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[tokio::test]
+    async fn read_files_missing_file_is_attachment_error() {
+        let missing = temp_path("no-existe.txt");
+        let err = read_files(&[missing]).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_files_non_utf8_is_attachment_error() {
+        let path = temp_path("bin.dat");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("write bin");
+        let err = read_files(std::slice::from_ref(&path)).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- attachments spec: Imágenes multimodales ---
+
+    #[tokio::test]
+    async fn read_images_encodes_base64_and_mime() {
+        let path = temp_path("foto.png");
+        std::fs::write(&path, b"PNGDATA").expect("write png");
+
+        let images = read_images(std::slice::from_ref(&path))
+            .await
+            .expect("lectura imagen");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].data, "UE5HREFUQQ==");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn read_images_missing_file_is_attachment_error() {
+        let missing = temp_path("no-existe.png");
+        let err = read_images(&[missing]).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_images_unknown_extension_is_attachment_error() {
+        let path = temp_path("documento.pdf");
+        std::fs::write(&path, b"%PDF").expect("write pdf");
+        let err = read_images(std::slice::from_ref(&path)).await.unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mime_from_path_recognizes_supported_extensions() {
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.png")).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.jpg")).unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.JPEG")).unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.gif")).unwrap(),
+            "image/gif"
+        );
+        assert_eq!(
+            mime_from_path(&PathBuf::from("a.webp")).unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[test]
+    fn mime_from_path_unknown_extension_is_error() {
+        let err = mime_from_path(&PathBuf::from("a.bmp")).unwrap_err();
+        assert!(matches!(err, IABotError::Attachment(_)), "err: {err}");
     }
 
     #[tokio::test]
